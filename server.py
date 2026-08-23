@@ -1362,5 +1362,11 @@ def get_query_structure(query_name: str, object_version: str = "A") -> dict:
 # Entry point
 # ---------------------------------------------------------------------------
 
-if __name__ == "__main__":
+
+def main() -> None:
+    """Console-script entry point: start the MCP server over stdio."""
     mcp.run()
+
+
+if __name__ == "__main__":
+    main()
