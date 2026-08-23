@@ -1,0 +1,19 @@
+# Kiro local settings — contains credentials (BW/SAP username & password)
+.kiro/settings/
+
+# Python build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Temporary / scratch test scripts
+_test_*.py
+
+# Aborted clone leftover
+mcp-bw-modelling-api/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
