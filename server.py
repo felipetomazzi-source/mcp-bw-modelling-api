@@ -1565,6 +1565,159 @@ def get_query_structure(query_name: str, object_version: str = "A") -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Data flow / lineage tool
+# ---------------------------------------------------------------------------
+
+
+def _get_transformation_endpoints(transformation_id: str) -> dict:
+    """Return the source and target of a transformation.
+
+    Reads the TRFN model and returns {"source": {...}, "target": {...}} where
+    each side has name, type (RSDS/ADSO/IOBJ/...), subType, and (for a
+    DataSource source) the source system parsed from the name field.
+    """
+    conn = BWConnection.from_env()
+
+    def _local(tag: str) -> str:
+        return tag.split("}")[-1] if "}" in tag else tag
+
+    try:
+        response = _bw_request(
+            conn,
+            f"/sap/bw/modeling/trfn/{transformation_id}",
+            accept="application/vnd.sap.bw.modeling.trfn-v1_0_0+xml",
+        )
+    except requests.exceptions.HTTPError:
+        return {}
+
+    root = ET.fromstring(response.text)
+
+    def _endpoint(elem):
+        if elem is None:
+            return {}
+        attrs = {_local(k): v for k, v in elem.attrib.items()}
+        # A DataSource (RSDS) name packs the DataSource + logical system,
+        # e.g. "0COSTCENTER_ATTR              ECDCLNT200". Split on whitespace.
+        raw_name = (attrs.get("name") or "").strip()
+        ep = {
+            "name": raw_name,
+            "type": attrs.get("type", ""),
+            "subType": attrs.get("subType", ""),
+        }
+        if attrs.get("type") == "RSDS":
+            parts = raw_name.split()
+            if len(parts) >= 2:
+                ep["dataSource"] = parts[0]
+                ep["sourceSystem"] = parts[-1]
+            else:
+                ep["dataSource"] = raw_name
+        return ep
+
+    source = next((c for c in list(root) if _local(c.tag) == "source"), None)
+    target = next((c for c in list(root) if _local(c.tag) == "target"), None)
+    return {"source": _endpoint(source), "target": _endpoint(target)}
+
+
+@mcp.tool
+def get_data_flow(object_name: str, object_type: str = "IOBJ") -> dict:
+    """
+    Show the data flow (lineage) around a BW object: what feeds INTO it and
+    what it feeds OUT to, via transformations and their DataSources.
+
+    Uses the BW Modeling where-used (xref) service to find related
+    transformations, then reads each transformation's source and target to
+    determine direction reliably (rather than parsing titles). For inbound
+    transformations whose source is a DataSource, the DataSource name and
+    source system are resolved.
+
+    Args:
+        object_name: Technical name of the object (e.g. "0COSTCENTER").
+        object_type: Object type code (default "IOBJ"). Also e.g. ADSO, HCPR.
+
+    Returns:
+        Dictionary with:
+          - inbound: transformations that load INTO the object (target = it),
+            each with transformationId, source (dataSource/sourceSystem/type),
+            and target subType (ATTR/TEXT/HIER for InfoObjects).
+          - outbound: transformations that read the object OUT to another
+            target (source = it), each with transformationId and target.
+          - relatedDataTransferProcesses: DTP technical names found in the
+            where-used list (the loads that execute these transformations).
+    """
+    conn = BWConnection.from_env()
+    NS = {
+        "atom": "http://www.w3.org/2005/Atom",
+        "bwModel": "http://www.sap.com/bw/modeling",
+    }
+    version = "A"
+
+    try:
+        response = _bw_request(
+            conn,
+            "/sap/bw/modeling/repo/is/xref",
+            params={
+                "objectType": object_type.upper(),
+                "objectName": object_name,
+                "objectVersion": version,
+            },
+            accept="application/xml",
+        )
+    except requests.exceptions.HTTPError as e:
+        return {
+            "error": f"HTTP {e.response.status_code}: {e.response.reason}",
+            "object": object_name,
+        }
+
+    root = ET.fromstring(response.text)
+
+    transformation_ids = []
+    dtp_names = []
+    for entry in root.findall("atom:entry", NS):
+        obj = entry.find("atom:content/bwModel:object", NS)
+        if obj is None:
+            continue
+        otype = obj.get("objectType", "")
+        oname = obj.get("objectName", "")
+        if otype == "TRFN":
+            transformation_ids.append(oname)
+        elif otype == "DTPA":
+            dtp_names.append(oname)
+
+    inbound = []
+    outbound = []
+    target_name_upper = object_name.upper()
+    for tid in transformation_ids:
+        endpoints = _get_transformation_endpoints(tid)
+        src = endpoints.get("source", {})
+        tgt = endpoints.get("target", {})
+        if tgt.get("name", "").upper() == target_name_upper:
+            inbound.append(
+                {
+                    "transformationId": tid,
+                    "source": src,
+                    "targetSubType": tgt.get("subType", ""),
+                }
+            )
+        elif src.get("name", "").upper().startswith(target_name_upper):
+            outbound.append(
+                {
+                    "transformationId": tid,
+                    "target": tgt,
+                }
+            )
+
+    return {
+        "object": object_name,
+        "objectType": object_type.upper(),
+        "inboundCount": len(inbound),
+        "inbound": inbound,
+        "outboundCount": len(outbound),
+        "outbound": outbound,
+        "relatedDataTransferProcesses": dtp_names,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
