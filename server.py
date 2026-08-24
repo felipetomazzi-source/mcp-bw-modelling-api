@@ -1618,6 +1618,71 @@ def _get_transformation_endpoints(transformation_id: str) -> dict:
     return {"source": _endpoint(source), "target": _endpoint(target)}
 
 
+def _get_dtp_endpoints(dtp_id: str) -> dict:
+    """Return the source, target, and status of a Data Transfer Process.
+
+    Reads the DTPA model and returns {"source": {...}, "target": {...},
+    "objectStatus": ..., "contentState": ..., "version": ...}. Each endpoint
+    has name and type; for a DataSource source (tlogo RSDS) the DataSource
+    name and source system are parsed from the packed name field.
+    """
+    conn = BWConnection.from_env()
+
+    def _local(tag: str) -> str:
+        return tag.split("}")[-1] if "}" in tag else tag
+
+    try:
+        response = _bw_request(
+            conn,
+            f"/sap/bw/modeling/dtpa/{dtp_id}",
+            accept="application/vnd.sap.bw.modeling.dtpa-v1_0_0+xml",
+        )
+    except requests.exceptions.HTTPError:
+        return {}
+
+    root = ET.fromstring(response.text)
+
+    def _endpoint(elem):
+        if elem is None:
+            return {}
+        attrs = {_local(k): v for k, v in elem.attrib.items()}
+        raw_name = (attrs.get("name") or "").strip()
+        # A DTP source/target uses 'type' plus 'tlogo' (RSDS/ADSO/IOBJ/...).
+        ep = {
+            "name": raw_name,
+            "type": attrs.get("tlogo", "") or attrs.get("type", ""),
+        }
+        if (attrs.get("tlogo") == "RSDS") or (attrs.get("type") == "DTASRC"):
+            parts = raw_name.split()
+            if len(parts) >= 2:
+                ep["dataSource"] = parts[0]
+                ep["sourceSystem"] = parts[-1]
+            else:
+                ep["dataSource"] = raw_name
+        return ep
+
+    source = next((c for c in root.iter() if _local(c.tag) == "source"), None)
+    target = next((c for c in root.iter() if _local(c.tag) == "target"), None)
+
+    result = {"source": _endpoint(source), "target": _endpoint(target)}
+
+    # Status: objectStatus / contentState (activation) live in child elements,
+    # and version ("active"/"revised") is an adtcore attribute in tlogoProperties.
+    obj_status = next((c for c in root.iter() if _local(c.tag) == "objectStatus"), None)
+    content_state = next((c for c in root.iter() if _local(c.tag) == "contentState"), None)
+    if obj_status is not None and obj_status.text:
+        result["objectStatus"] = obj_status.text.strip()
+    if content_state is not None and content_state.text:
+        result["contentState"] = content_state.text.strip()
+    tlogo = next((c for c in root.iter() if _local(c.tag) == "tlogoProperties"), None)
+    if tlogo is not None:
+        ver = tlogo.get("{http://www.sap.com/adt/core}version") or tlogo.get("version")
+        if ver:
+            result["version"] = ver
+
+    return result
+
+
 @mcp.tool
 def get_data_flow(object_name: str, object_type: str = "IOBJ") -> dict:
     """
@@ -1641,8 +1706,15 @@ def get_data_flow(object_name: str, object_type: str = "IOBJ") -> dict:
             and target subType (ATTR/TEXT/HIER for InfoObjects).
           - outbound: transformations that read the object OUT to another
             target (source = it), each with transformationId and target.
-          - relatedDataTransferProcesses: DTP technical names found in the
-            where-used list (the loads that execute these transformations).
+          - inboundDataTransferProcesses: DTPs whose TARGET is this object,
+            each with dtp id, source, and status (objectStatus/contentState/
+            version).
+          - outboundDataTransferProcesses: DTPs whose SOURCE is this object,
+            each with dtp id, target, and status.
+
+    NOTE: process-chain usage of a DTP (which chains run it) is NOT available
+    via the BW Modeling API; that relationship lives in the RSPCCHAIN table and
+    requires table access (e.g. the ABAP ADT server), not this modeling API.
     """
     conn = BWConnection.from_env()
     NS = {
@@ -1683,9 +1755,10 @@ def get_data_flow(object_name: str, object_type: str = "IOBJ") -> dict:
         elif otype == "DTPA":
             dtp_names.append(oname)
 
+    target_name_upper = object_name.upper()
+
     inbound = []
     outbound = []
-    target_name_upper = object_name.upper()
     for tid in transformation_ids:
         endpoints = _get_transformation_endpoints(tid)
         src = endpoints.get("source", {})
@@ -1706,6 +1779,26 @@ def get_data_flow(object_name: str, object_type: str = "IOBJ") -> dict:
                 }
             )
 
+    # Split DTPs by direction using each DTP's actual source/target, and
+    # attach the DTP's status. A DTP is inbound when its target is this object.
+    inbound_dtps = []
+    outbound_dtps = []
+    for dtp in dtp_names:
+        endpoints = _get_dtp_endpoints(dtp)
+        if not endpoints:
+            continue
+        src = endpoints.get("source", {})
+        tgt = endpoints.get("target", {})
+        status = {
+            "objectStatus": endpoints.get("objectStatus", ""),
+            "contentState": endpoints.get("contentState", ""),
+            "version": endpoints.get("version", ""),
+        }
+        if tgt.get("name", "").upper() == target_name_upper:
+            inbound_dtps.append({"dtp": dtp, "source": src, "status": status})
+        elif src.get("name", "").upper().startswith(target_name_upper):
+            outbound_dtps.append({"dtp": dtp, "target": tgt, "status": status})
+
     return {
         "object": object_name,
         "objectType": object_type.upper(),
@@ -1713,7 +1806,10 @@ def get_data_flow(object_name: str, object_type: str = "IOBJ") -> dict:
         "inbound": inbound,
         "outboundCount": len(outbound),
         "outbound": outbound,
-        "relatedDataTransferProcesses": dtp_names,
+        "inboundDataTransferProcessCount": len(inbound_dtps),
+        "inboundDataTransferProcesses": inbound_dtps,
+        "outboundDataTransferProcessCount": len(outbound_dtps),
+        "outboundDataTransferProcesses": outbound_dtps,
     }
 
 
