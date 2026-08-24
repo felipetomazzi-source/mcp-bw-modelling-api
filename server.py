@@ -5,6 +5,7 @@ Exposes SAP BW4/HANA modeling resources (InfoAreas, InfoObjects, ADSOs,
 CompositeProviders, Queries, etc.) as MCP tools via FastMCP.
 """
 
+import json
 import os
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
@@ -164,6 +165,58 @@ def _parse_object_details(xml_text: str) -> dict:
     return details
 
 
+def _parse_hcpr_details(xml_text: str) -> dict:
+    """Parse key metadata from a Composite:compositeView (CompositeProvider).
+
+    The CompositeProvider model is not Atom-based; its descriptive metadata
+    lives in a <tlogoProperties> child of the root, and the display label in
+    <endUserTexts>. Also summarize the source providers and combination type.
+    """
+    root = ET.fromstring(xml_text)
+
+    def _local(tag: str) -> str:
+        return tag.split("}")[-1] if "}" in tag else tag
+
+    def _xsi(elem) -> str:
+        v = elem.get("{http://www.w3.org/2001/XMLSchema-instance}type", "")
+        return v.split(":")[-1] if ":" in v else v
+
+    details: dict = {}
+
+    # Root attributes (name, schema/model flags)
+    details["name"] = root.get("name", "")
+    if root.get("withHanaModel"):
+        details["withHanaModel"] = root.get("withHanaModel")
+
+    for child in list(root):
+        tag = _local(child.tag)
+        if tag == "endUserTexts" and child.get("label"):
+            details["description"] = child.get("label")
+        elif tag == "tlogoProperties":
+            for key in (
+                "description", "responsible", "createdBy", "createdAt",
+                "changedBy", "changedAt", "version", "masterLanguage",
+            ):
+                if child.get(key):
+                    details.setdefault(key, child.get(key))
+
+    # Summarize source (part) providers and their combination type.
+    part_providers = []
+    combination = ""
+    for node in root.iter():
+        if _local(node.tag) != "viewNode":
+            continue
+        combination = combination or _xsi(node)
+        for inp in list(node):
+            if _local(inp.tag) == "input" and inp.get("name"):
+                part_providers.append(inp.get("name"))
+    if part_providers:
+        details["combination"] = combination
+        details["partProviders"] = part_providers
+
+    return details
+
+
 def _parse_value_help(xml_text: str) -> list[dict]:
     """Parse a BW Modeling value-help response into a list of row dicts.
 
@@ -198,9 +251,36 @@ def _parse_value_help(xml_text: str) -> list[dict]:
 mcp = FastMCP(
     "SAP BW Modeling API",
     instructions=(
-        "This MCP server provides access to SAP BW4/HANA modeling objects "
-        "via the BW Modeling API. You can search and explore InfoAreas, "
-        "InfoObjects, ADSOs, CompositeProviders, Queries, and more."
+        "Access SAP BW/4HANA modeling objects (InfoAreas, InfoObjects, ADSOs, "
+        "CompositeProviders, Queries, Transformations) via the BW Modeling API.\n"
+        "\n"
+        "OBJECT TYPE CODES (used by search_bw_objects / get_object_details):\n"
+        "  AREA=InfoArea, IOBJ=InfoObject, ADSO=DataStore Object (advanced),\n"
+        "  HCPR=CompositeProvider, QUERY=Query, TRFN=Transformation,\n"
+        "  DTP=Data Transfer Process, MPRO=MultiProvider, ODSO=classic DSO.\n"
+        "\n"
+        "TYPICAL WORKFLOW - explore, then drill into details:\n"
+        "  1. Discover objects: search_bw_objects (any type) or the typed\n"
+        "     listers list_infoareas / list_infoobjects / list_adsos /\n"
+        "     list_composite_providers / list_queries. Wildcards use trailing\n"
+        "     '*' (e.g. 'B080*'); leading wildcards are not supported.\n"
+        "  2. Inspect an object with the matching detail tool:\n"
+        "     - InfoObject   -> get_infoobject_details (attributes, nav vs\n"
+        "                       display, compounding, data type)\n"
+        "     - ADSO         -> get_adso_fields (field/InfoObject list)\n"
+        "     - HCPR         -> get_composite_provider_parts (source providers)\n"
+        "     - Query        -> get_query_structure (characteristics, key\n"
+        "                       figures, measures) AND get_query_filters\n"
+        "                       (fixed/default filters, restricted key figures)\n"
+        "     - Transformation -> get_transformation_details\n"
+        "     - anything     -> get_object_details (generic metadata)\n"
+        "\n"
+        "FINDING QUERIES ON A PROVIDER: call list_queries with info_provider=\n"
+        "  '<HCPR or ADSO name>' (e.g. 'B080_V05'). Do not use info_area for\n"
+        "  queries. For a full picture of one query, combine get_query_structure\n"
+        "  with get_query_filters.\n"
+        "\n"
+        "Use check_connection first if calls fail, to confirm connectivity/auth."
     ),
 )
 
@@ -386,9 +466,24 @@ def list_queries(
 
     Queries are reporting definitions built on top of CompositeProviders or ADSOs.
 
+    RECOMMENDED USAGE: to list the queries built on a specific InfoProvider
+    (CompositeProvider or ADSO), pass info_provider (e.g. "B080_V05"). This uses
+    a dedicated endpoint and is the reliable way to answer "which queries run on
+    provider X". Do NOT use info_area for that - queries belong to an
+    InfoProvider, not an InfoArea.
+
+    KNOWN LIMITATIONS (of the generic name-search path, used when info_provider
+    is empty):
+      - info_area filtering with objectType=QUERY tends to fail with HTTP 500
+        on many systems; prefer info_provider instead.
+      - Leading-wildcard patterns (e.g. "*B080*") are rejected by the search
+        API and fail. Use a prefix pattern ("B080*") or an exact name.
+
     Args:
-        search_term: Filter by name pattern (supports * wildcard).
+        search_term: Filter by name pattern. Trailing "*" wildcard works
+            ("B080*"); a leading wildcard ("*B080*") is not supported.
         info_area: Filter by InfoArea technical name. Leave empty for all.
+            Not recommended for queries (see KNOWN LIMITATIONS).
         info_provider: Filter by InfoProvider (e.g. CompositeProvider or ADSO,
             such as "B080_V05"). This is the recommended way to list the queries
             built on a specific provider. Leave empty to search all.
@@ -490,7 +585,7 @@ def get_object_details(
     type_accepts = {
         "IOBJ": "application/vnd.sap-bw-modeling.iobj-v2_1_0+xml",
         "ADSO": "application/vnd.sap.bw.modeling.adso-v1_5_0+xml",
-        "HCPR": "application/vnd.sap.bw.modeling.hcpr-v1_0_0+xml",
+        "HCPR": "application/vnd.sap.bw.modeling.hcpr-v1_15_0+xml",
         "QUERY": "application/vnd.sap.bw.modeling.query-v1_10_0+xml",
         "TRFN": "application/vnd.sap.bw.modeling.trfn-v1_0_0+xml",
         "DTPA": "application/vnd.sap.bw.modeling.dtpa-v1_0_0+xml",
@@ -510,6 +605,10 @@ def get_object_details(
             # Query uses the Qry:queryResource schema, not the Atom/properties
             # format; extract key attributes from the nested Query element.
             details = _parse_query_details(response.text)
+        elif object_type == "HCPR":
+            # CompositeProvider uses the Composite:compositeView schema; the
+            # metadata lives in the tlogoProperties child element.
+            details = _parse_hcpr_details(response.text)
         else:
             details = _parse_object_details(response.text)
         details["objectName"] = object_name
@@ -572,11 +671,18 @@ def get_composite_provider_parts(object_name: str) -> list[dict]:
     """
     Get the part providers (data sources) of a CompositeProvider.
 
+    A CompositeProvider combines several source InfoProviders (ADSOs,
+    InfoObjects, Open ODS Views) via Union or Join nodes. This returns each
+    source (part) provider with the combination type of its parent node.
+
     Args:
-        object_name: Technical name of the CompositeProvider (e.g. "ZSDHCPR01").
+        object_name: Technical name of the CompositeProvider (e.g. "B080_V05").
 
     Returns:
-        List of part providers with their names and join/union type.
+        List of part providers, each with:
+          - name: source provider technical name (e.g. an ADSO)
+          - alias: the CompositeProvider's internal alias for the source
+          - combination: "Union" or "Join" (from the parent view node)
     """
     conn = BWConnection.from_env()
 
@@ -584,33 +690,40 @@ def get_composite_provider_parts(object_name: str) -> list[dict]:
 
     try:
         response = _bw_request(
-            conn, path, accept="application/vnd.sap.bw.modeling.hcpr-v1_0_0+xml"
+            conn, path, accept="application/vnd.sap.bw.modeling.hcpr-v1_15_0+xml"
         )
-        root = ET.fromstring(response.text)
-        parts = []
-        entries = root.findall("atom:entry", NAMESPACES)
-
-        for entry in entries:
-            title = entry.find("atom:title", NAMESPACES)
-            content = entry.find("atom:content", NAMESPACES)
-
-            part = {
-                "name": title.text if title is not None else "",
-            }
-
-            if content is not None:
-                props = content.find("m:properties", NAMESPACES)
-                if props is not None:
-                    for child in props:
-                        tag = child.tag.split("}")[-1] if "}" in child.tag else child.tag
-                        if child.text:
-                            part[tag] = child.text
-
-            parts.append(part)
-
-        return parts
     except requests.exceptions.HTTPError as e:
         return [{"error": f"HTTP {e.response.status_code}: {e.response.reason}", "object": object_name}]
+
+    root = ET.fromstring(response.text)
+
+    def _local(tag: str) -> str:
+        return tag.split("}")[-1] if "}" in tag else tag
+
+    def _xsi(elem) -> str:
+        v = elem.get("{http://www.w3.org/2001/XMLSchema-instance}type", "")
+        return v.split(":")[-1] if ":" in v else v
+
+    # The CompositeProvider model (Composite:compositeView) nests source
+    # providers as <input> elements (xsi:type Composite:CompositeInput) inside
+    # viewNode elements whose xsi:type is View:Union or View:Join.
+    parts = []
+    for node in root.iter():
+        if _local(node.tag) != "viewNode":
+            continue
+        combination = _xsi(node)  # e.g. "Union" -> from "View:Union"
+        for child in list(node):
+            if _local(child.tag) != "input":
+                continue
+            parts.append(
+                {
+                    "name": child.get("name", ""),
+                    "alias": child.get("alias", ""),
+                    "combination": combination,
+                }
+            )
+
+    return parts
 
 
 @mcp.tool
@@ -618,13 +731,96 @@ def get_infoobject_details(infoobject_name: str) -> dict:
     """
     Get detailed properties of an InfoObject (characteristic or key figure).
 
+    Returns the InfoObject's general properties, data-dictionary type info,
+    compounding, text/master-data flags, and its attributes split into
+    navigational (usable for query drilldown) versus display-only.
+
     Args:
-        infoobject_name: Technical name (e.g. "0MATERIAL", "0PLANT", "ZCUSTOMER").
+        infoobject_name: Technical name (e.g. "0MATERIAL", "0PLANT", "0COSTCENTER").
 
     Returns:
-        Dictionary with InfoObject properties (type, data type, length, etc.).
+        Dictionary with:
+          - infoObjectType, infoArea, description, dataType/length/conversionExit
+          - compounds: list of compounding InfoObjects (superior keys)
+          - navigationAttributes: attributes usable as navigation attributes
+          - displayAttributes: attributes shown only as display attributes
+          - attributes: full attribute list with navigational/displayInQuery flags
     """
-    return get_object_details(infoobject_name, "IOBJ")
+    conn = BWConnection.from_env()
+    path = f"/sap/bw/modeling/iobj/{infoobject_name}"
+
+    try:
+        response = _bw_request(
+            conn,
+            path,
+            accept="application/vnd.sap.bw.modeling.infoobject-v2_1_0+json",
+        )
+    except requests.exceptions.HTTPError as e:
+        return {
+            "error": f"HTTP {e.response.status_code}: {e.response.reason}",
+            "object": infoobject_name,
+        }
+
+    try:
+        data = json.loads(response.text)
+    except json.JSONDecodeError:
+        return {"error": "Could not parse InfoObject response", "object": infoobject_name}
+
+    result: dict = {
+        "objectName": infoobject_name,
+        "objectType": "IOBJ",
+        "infoObjectType": data.get("infoObjectType", ""),
+    }
+
+    general = data.get("generalProperties", {})
+    result["infoArea"] = general.get("infoArea", "")
+    descriptions = general.get("descriptions", [])
+    if descriptions:
+        first = descriptions[0]
+        result["description"] = first.get("longText") or first.get("shortText", "")
+
+    # Data-dictionary properties live under referenceOrBasisCharacteristic.
+    basis = data.get("referenceOrBasisCharacteristic", {})
+    ddic = basis.get("dataDictionary", {})
+    if ddic:
+        result["dataType"] = ddic.get("type", "")
+        result["internalLength"] = ddic.get("internalLength")
+        result["outputLength"] = ddic.get("outputLength")
+        result["conversionExit"] = ddic.get("conversionExit", "")
+        result["supportsLowercase"] = ddic.get("supportsLowercaseCharacters")
+        result["highCardinality"] = ddic.get("hasHighCardinality")
+    result["masterDataIsTimeDependent"] = basis.get("masterDataIsTimeDependant")
+
+    # Compounding (superior key InfoObjects).
+    result["compounds"] = data.get("compounds", []) or []
+
+    # Attributes: split into navigational vs display-only. The
+    # canBeUsedAsNavigationAttribute flag distinguishes them; noDisplayInQuery
+    # marks an attribute hidden from query display.
+    attributes = basis.get("attributes", []) or data.get("attributes", []) or []
+    nav, disp, full = [], [], []
+    for attr in attributes:
+        name = attr.get("name", "")
+        is_nav = bool(attr.get("canBeUsedAsNavigationAttribute", False))
+        display_in_query = not bool(attr.get("noDisplayInQuery", False))
+        full.append(
+            {
+                "name": name,
+                "navigational": is_nav,
+                "displayInQuery": display_in_query,
+            }
+        )
+        if is_nav:
+            nav.append(name)
+        else:
+            disp.append(name)
+
+    result["navigationAttributes"] = nav
+    result["displayAttributes"] = disp
+    result["attributeCount"] = len(full)
+    result["attributes"] = full
+
+    return result
 
 
 @mcp.tool
@@ -1074,6 +1270,11 @@ def get_query_filters(query_name: str, object_version: str = "A") -> dict:
     """
     Read the filter restrictions defined on a BW Query.
 
+    Complements get_query_structure: use get_query_structure for the query's
+    characteristics, key figures, and measures; use this tool for the filter
+    restrictions and restricted key figures. Together they give a full picture
+    of how a query is built.
+
     Retrieves the query model from the BW Modeling API and extracts the global
     query filter: for each restricted characteristic it returns the fixed value
     ranges and/or the variable references that restrict it.
@@ -1226,6 +1427,11 @@ _AXIS_LABELS = {"rows": "row", "columns": "column", "free": "free"}
 def get_query_structure(query_name: str, object_version: str = "A") -> dict:
     """
     List the characteristics and key figures used in a BW Query.
+
+    Complements get_query_filters: use this tool for the query's characteristics,
+    key figures, and measures; use get_query_filters for the filter restrictions
+    and restricted key figures. Together they give a full picture of how a query
+    is built.
 
     Retrieves the query model from the BW Modeling API and returns:
       - characteristics: every characteristic (InfoObject / navigation
