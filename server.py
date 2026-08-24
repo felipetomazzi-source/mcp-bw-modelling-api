@@ -7,8 +7,10 @@ CompositeProviders, Queries, etc.) as MCP tools via FastMCP.
 
 import json
 import os
+import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
+from urllib.parse import quote
 
 import requests
 import urllib3
@@ -938,18 +940,143 @@ def check_connection() -> dict:
         return {"status": "error", "message": "Connection timed out."}
 
 
+def _fetch_abap_program_source(conn: "BWConnection", program_name: str) -> str:
+    """Fetch the full ABAP source of a program via the ADT REST service.
+
+    BW generates the runtime for a transformation (start/end/expert routines
+    and all field-level rule routines) into a single ABAP program, named in the
+    transformation model's ``abapProgram`` attribute. That program's source is
+    served by the ABAP Development Tools resource
+    ``/sap/bc/adt/programs/programs/<name>/source/main`` (name lowercased,
+    slashes percent-encoded).
+    """
+    enc = quote(program_name.lower(), safe="")
+    url = f"{conn.base_url}/sap/bc/adt/programs/programs/{enc}/source/main"
+    response = requests.get(
+        url,
+        auth=(conn.username, conn.password),
+        headers={"Accept": "text/plain", "sap-client": conn.client},
+        verify=conn.verify_ssl,
+        timeout=60,
+    )
+    response.raise_for_status()
+    return response.text
+
+
+def _extract_abap_routines(program_source: str) -> list[dict]:
+    """Extract the routine method bodies from a generated transformation program.
+
+    In the generated program each transformation routine is an ABAP method:
+      - ``compute_<rule>_<step>``  -> a field-level rule routine
+      - ``invert_<rule>_<step>``   -> the corresponding inverse routine
+      - ``start_routine`` / ``end_routine`` / ``expert_routine`` / ``global...``
+    Only the customer-editable portion is meaningful; the generated wrapper is
+    included so the reader sees the method signature comments (which document
+    the source/target fields for the routine).
+
+    Returns a list of dicts with the method name, the target field (when the
+    generated comment exposes it), the 1-based line span in the program, and
+    the full method text.
+    """
+    lines = program_source.splitlines()
+    routines: list[dict] = []
+
+    # Match method implementations whose names indicate a transformation routine.
+    method_re = re.compile(
+        r"^\s*method\s+"
+        r"(compute_\w+|invert_\w+|\w*start_routine\w*|\w*end_routine\w*|"
+        r"\w*expert_routine\w*|\w*global\w*)\s*\.",
+        re.IGNORECASE,
+    )
+    endmethod_re = re.compile(r"^\s*endmethod\b", re.IGNORECASE)
+    target_re = re.compile(r"target field:\s*(\S+)", re.IGNORECASE)
+
+    idx = 0
+    n = len(lines)
+    while idx < n:
+        m = method_re.match(lines[idx])
+        if not m:
+            idx += 1
+            continue
+
+        start = idx
+        end = start
+        for j in range(start, n):
+            if endmethod_re.match(lines[j]):
+                end = j
+                break
+        else:
+            end = n - 1
+
+        body = lines[start : end + 1]
+        target = ""
+        for ln in body:
+            tm = target_re.search(ln)
+            if tm:
+                target = tm.group(1)
+                break
+
+        routines.append(
+            {
+                "method": m.group(1),
+                "targetField": target,
+                "startLine": start + 1,
+                "endLine": end + 1,
+                "code": "\n".join(body),
+            }
+        )
+        idx = end + 1
+
+    return routines
+
+
 @mcp.tool
-def get_transformation_details(transformation_id: str) -> dict:
+def get_transformation_details(
+    transformation_id: str,
+    include_abap_code: bool = True,
+    include_full_program: bool = False,
+    include_raw_xml: bool = False,
+) -> dict:
     """
     Get detailed metadata for a transformation including source, target,
-    and rule information.
+    rule information, and (optionally) the ABAP routine source code.
+
+    The transformation model itself only describes the rule structure. The
+    actual ABAP for start/end/expert routines and field-level rule routines is
+    generated into a single ABAP program (the model's ``abapProgram``). When
+    ``include_abap_code`` is set, this tool also fetches that program's source
+    via the ABAP Development Tools (ADT) service and extracts the individual
+    routine methods (e.g. ``compute_<rule>_<step>`` for a field routine).
+
+    Payloads can get large: the transformation model XML and the full generated
+    program source are each substantial. By default only the parsed routine
+    methods (``abapRoutines``) are returned - that is the useful part for
+    reading routine logic. Use the flags below to opt into the bulky fields.
 
     Args:
         transformation_id: Technical ID of the transformation
             (e.g. "004BKVTJ2PRM1HA8G1Z7SB2E9VLVYK14").
+        include_abap_code: If True (default), also retrieve the generated ABAP
+            program name and the parsed routine methods. Set to False to
+            return only the transformation model metadata.
+        include_full_program: If True, also include the full generated ABAP
+            program source under ``abapProgramSource``. Defaults to False to
+            keep the response small; the parsed ``abapRoutines`` are usually
+            enough. Only takes effect when ``include_abap_code`` is True.
+        include_raw_xml: If True, include the full transformation model XML
+            under ``rawXml``. Defaults to False to keep the response small.
 
     Returns:
-        Dictionary with transformation details (source, target, rules, routines).
+        Dictionary with transformation details (source, target, rules). When
+        ABAP code is included, adds:
+          - abapProgram: the generated program name
+          - abapRoutines: list of routine methods, each with method name,
+            target field (if known), line span, and code
+          - abapProgramSource: the full generated program source (only when
+            include_full_program is True)
+        With include_raw_xml=True, also adds ``rawXml``. If the ABAP retrieval
+        fails, an ``abapCodeError`` entry explains why while the model metadata
+        is still returned.
     """
     conn = BWConnection.from_env()
     path = f"/sap/bw/modeling/trfn/{transformation_id}"
@@ -967,20 +1094,46 @@ def get_transformation_details(transformation_id: str) -> dict:
             "objectName": transformation_id,
             "objectType": "TRFN",
             "typeName": "Transformation",
-            "rawXml": response.text,
         }
+        if include_raw_xml:
+            details["rawXml"] = response.text
 
         # Try to extract basic info from the root element attributes
         for key, value in root.attrib.items():
             clean_key = key.split("}")[-1] if "}" in key else key
             details[clean_key] = value
 
-        return details
     except requests.exceptions.HTTPError as e:
         return {
             "error": f"HTTP {e.response.status_code}: {e.response.reason}",
             "object": transformation_id,
         }
+
+    # Optionally enrich with the generated ABAP routine source.
+    if include_abap_code:
+        program_name = details.get("abapProgram", "")
+        if not program_name:
+            details["abapCodeError"] = (
+                "Transformation model has no abapProgram attribute; it may not "
+                "contain any ABAP routines."
+            )
+        else:
+            try:
+                source = _fetch_abap_program_source(conn, program_name)
+                details["abapRoutines"] = _extract_abap_routines(source)
+                if include_full_program:
+                    details["abapProgramSource"] = source
+            except requests.exceptions.HTTPError as e:
+                details["abapCodeError"] = (
+                    f"Could not fetch ABAP program '{program_name}' via ADT: "
+                    f"HTTP {e.response.status_code}: {e.response.reason}"
+                )
+            except requests.exceptions.RequestException as e:
+                details["abapCodeError"] = (
+                    f"Could not fetch ABAP program '{program_name}' via ADT: {e}"
+                )
+
+    return details
 
 
 # ---------------------------------------------------------------------------
