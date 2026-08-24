@@ -638,32 +638,73 @@ def get_adso_fields(object_name: str) -> list[dict]:
         response = _bw_request(
             conn, path, accept="application/vnd.sap.bw.modeling.adso-v1_5_0+xml"
         )
-        root = ET.fromstring(response.text)
-        fields = []
-        entries = root.findall("atom:entry", NAMESPACES)
-
-        for entry in entries:
-            title = entry.find("atom:title", NAMESPACES)
-            content = entry.find("atom:content", NAMESPACES)
-
-            field = {
-                "name": title.text if title is not None else "",
-            }
-
-            # Try to extract field properties
-            if content is not None:
-                props = content.find("m:properties", NAMESPACES)
-                if props is not None:
-                    for child in props:
-                        tag = child.tag.split("}")[-1] if "}" in child.tag else child.tag
-                        if child.text:
-                            field[tag] = child.text
-
-            fields.append(field)
-
-        return fields
     except requests.exceptions.HTTPError as e:
         return [{"error": f"HTTP {e.response.status_code}: {e.response.reason}", "object": object_name}]
+
+    root = ET.fromstring(response.text)
+
+    def _local(tag: str) -> str:
+        return tag.split("}")[-1] if "}" in tag else tag
+
+    def _xsi(elem) -> str:
+        v = elem.get("{http://www.w3.org/2001/XMLSchema-instance}type", "")
+        return v.split(":")[-1] if ":" in v else v
+
+    # The ADSO model (adso:dataStore) lists fields as <element> children with
+    # xsi:type "adso:AdsoElement". <keyElement> children mark the key fields;
+    # their key InfoObject reference is in a keyInfoObjectName / text form.
+    # The element's dimension attribute encodes its kind: CHA=characteristic,
+    # TIM=time, UINI/UNI=unit/currency, KYF=key figure.
+    dim_kind = {
+        "CHA": "characteristic",
+        "TIM": "time",
+        "UINI": "unit",
+        "UNI": "unit",
+        "KYF": "keyfigure",
+    }
+
+    # Collect the set of key field names from <keyElement> entries. The key is
+    # given as a reference path in the element text, e.g. "#///0BILL_NUM"; the
+    # field name is the last path segment.
+    key_names = set()
+    for elem in root.iter():
+        if _local(elem.tag) != "keyElement":
+            continue
+        ref = (
+            elem.get("keyInfoObjectName")
+            or elem.get("infoObjectName")
+            or elem.get("name")
+            or (elem.text.strip() if elem.text and elem.text.strip() else "")
+        )
+        if ref:
+            # Take the last segment of a "#///NAME" style reference.
+            key_names.add(ref.split("/")[-1])
+
+    fields = []
+    for elem in root.iter():
+        if _xsi(elem) != "AdsoElement":
+            continue
+        iobj = elem.get("infoObjectName", "") or elem.get("name", "")
+        # dimension attr looks like "#///CHA" (may have a trailing marker char).
+        raw_dim = elem.get("dimension", "")
+        dim_code = ""
+        if raw_dim:
+            tail = raw_dim.rstrip().split("/")[-1]
+            dim_code = "".join(ch for ch in tail if ch.isalpha())
+        fields.append(
+            {
+                "name": elem.get("name", ""),
+                "infoObject": iobj,
+                "baseInfoObject": elem.get("baseInfoObjectName", ""),
+                "kind": dim_kind.get(dim_code, dim_code or ""),
+                "isKey": (elem.get("name", "") in key_names) or (iobj in key_names),
+                "aggregation": elem.get("aggregationBehavior", ""),
+                "conversionRoutine": elem.get("conversionRoutine", ""),
+                "outputLength": elem.get("outputLength", ""),
+            }
+        )
+
+    return fields
 
 
 @mcp.tool
