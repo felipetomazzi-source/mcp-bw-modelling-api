@@ -1680,6 +1680,24 @@ def _get_dtp_endpoints(dtp_id: str) -> dict:
         if ver:
             result["version"] = ver
 
+    # Process-chain usage is exposed directly in the DTP model, under
+    # <usageInProcessChains><processChain name=.. description=.. tlogo="RSPC"/>.
+    process_chains = []
+    seen_chains = set()
+    for usage in root.iter():
+        if _local(usage.tag) != "usageInProcessChains":
+            continue
+        for pc in list(usage):
+            if _local(pc.tag) != "processChain":
+                continue
+            name = pc.get("name", "")
+            if name and name not in seen_chains:
+                seen_chains.add(name)
+                process_chains.append(
+                    {"name": name, "description": pc.get("description", "")}
+                )
+    result["processChains"] = process_chains
+
     return result
 
 
@@ -1707,14 +1725,14 @@ def get_data_flow(object_name: str, object_type: str = "IOBJ") -> dict:
           - outbound: transformations that read the object OUT to another
             target (source = it), each with transformationId and target.
           - inboundDataTransferProcesses: DTPs whose TARGET is this object,
-            each with dtp id, source, and status (objectStatus/contentState/
-            version).
+            each with dtp id, source, status (objectStatus/contentState/
+            version), and processChains (the process chains that run the DTP).
           - outboundDataTransferProcesses: DTPs whose SOURCE is this object,
-            each with dtp id, target, and status.
+            each with dtp id, target, status, and processChains.
 
-    NOTE: process-chain usage of a DTP (which chains run it) is NOT available
-    via the BW Modeling API; that relationship lives in the RSPCCHAIN table and
-    requires table access (e.g. the ABAP ADT server), not this modeling API.
+    Process-chain usage is read from the DTP model itself (its
+    usageInProcessChains section), so each DTP entry lists the process chains
+    that execute it.
     """
     conn = BWConnection.from_env()
     NS = {
@@ -1794,10 +1812,15 @@ def get_data_flow(object_name: str, object_type: str = "IOBJ") -> dict:
             "contentState": endpoints.get("contentState", ""),
             "version": endpoints.get("version", ""),
         }
+        process_chains = endpoints.get("processChains", [])
         if tgt.get("name", "").upper() == target_name_upper:
-            inbound_dtps.append({"dtp": dtp, "source": src, "status": status})
+            inbound_dtps.append(
+                {"dtp": dtp, "source": src, "status": status, "processChains": process_chains}
+            )
         elif src.get("name", "").upper().startswith(target_name_upper):
-            outbound_dtps.append({"dtp": dtp, "target": tgt, "status": status})
+            outbound_dtps.append(
+                {"dtp": dtp, "target": tgt, "status": status, "processChains": process_chains}
+            )
 
     return {
         "object": object_name,
