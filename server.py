@@ -1718,6 +1718,162 @@ def get_data_flow(object_name: str, object_type: str = "IOBJ") -> dict:
 
 
 # ---------------------------------------------------------------------------
+# InfoArea tree tool
+# ---------------------------------------------------------------------------
+
+
+_INFOPROVIDER_STRUCTURE_ROOT = "/sap/bw/modeling/repo/infoproviderstructure/area"
+
+# Namespaces for the InfoProvider structure atom feeds.
+_STRUCT_NS = {
+    "atom": "http://www.w3.org/2005/Atom",
+    "bwModel": "http://www.sap.com/bw/modeling",
+}
+_CHILDREN_REL = "http://www.sap.com/bw/modeling/relations:children"
+
+
+def _children_href(entry) -> str:
+    """Return the 'children' link href of a structure entry, if present."""
+    link = entry.find(f"atom:link[@rel='{_CHILDREN_REL}']", _STRUCT_NS)
+    return link.get("href", "") if link is not None else ""
+
+
+def _fetch_structure_feed(conn, href: str):
+    """Fetch and parse an InfoProvider-structure atom feed at the given href."""
+    response = _bw_request(conn, href, accept="application/xml")
+    return ET.fromstring(response.text)
+
+
+def _fetch_infoarea_node(conn, area: str):
+    """Fetch the contents of one InfoArea node. Returns (subAreas, objects).
+
+    subAreas: list of {name, description} child InfoAreas to recurse into.
+    objects:  list of {name, type, typeName, description} objects assigned to
+              this area. Objects are grouped under semanticalFolder nodes (by
+              kind, e.g. "HCPR", "Characteristic"); this follows each folder's
+              children link to collect them.
+    """
+    sub_areas = []
+    objects = []
+
+    root = _fetch_structure_feed(conn, f"{_INFOPROVIDER_STRUCTURE_ROOT}/{area.lower()}")
+
+    for entry in root.findall("atom:entry", _STRUCT_NS):
+        obj = entry.find("atom:content/bwModel:object", _STRUCT_NS)
+        if obj is None:
+            continue
+        otype = obj.get("objectType", "")
+        oname = obj.get("objectName", "")
+        title = entry.findtext("atom:title", namespaces=_STRUCT_NS) or ""
+
+        if otype == "AREA":
+            sub_areas.append({"name": oname, "description": title})
+        elif otype == "semanticalFolder":
+            # Objects hang off the folder's children feed; fetch and collect.
+            href = _children_href(entry)
+            if not href:
+                continue
+            try:
+                folder_root = _fetch_structure_feed(conn, href)
+            except requests.exceptions.HTTPError:
+                continue
+            for fentry in folder_root.findall("atom:entry", _STRUCT_NS):
+                fobj = fentry.find("atom:content/bwModel:object", _STRUCT_NS)
+                if fobj is None:
+                    continue
+                ftype = fobj.get("objectType", "")
+                if ftype in ("AREA", "semanticalFolder"):
+                    continue
+                objects.append(
+                    {
+                        "name": fobj.get("objectName", ""),
+                        "type": ftype,
+                        "typeName": OBJECT_TYPES.get(ftype, ftype),
+                        "description": fentry.findtext(
+                            "atom:title", namespaces=_STRUCT_NS
+                        )
+                        or "",
+                    }
+                )
+        else:
+            objects.append(
+                {
+                    "name": oname,
+                    "type": otype,
+                    "typeName": OBJECT_TYPES.get(otype, otype),
+                    "description": title,
+                }
+            )
+
+    return sub_areas, objects
+
+
+@mcp.tool
+def get_infoarea_tree(info_area: str, recursive: bool = True, max_depth: int = 10) -> dict:
+    """
+    List the objects contained in an InfoArea using the InfoArea node tree.
+
+    This walks the BW InfoProvider structure (the InfoArea hierarchy as shown in
+    the modeling tools), which is the reliable way to see what belongs to an
+    InfoArea. InfoAreas nest: e.g. B080 ("Sales and Distribution") contains
+    sub-areas like B080_V, B080_D, B080_CM, whose leaf objects are the actual
+    ADSOs, CompositeProviders, and so on.
+
+    NOTE: prefer this over get_infoarea_contents for "what is under InfoArea X" -
+    get_infoarea_contents uses a generic search whose InfoArea filter is
+    unreliable and returns only a flat, unfiltered list.
+
+    Args:
+        info_area: InfoArea technical name (e.g. "B080").
+        recursive: If true (default), descend into sub-areas. If false, only the
+            direct children of the given InfoArea are returned.
+        max_depth: Safety limit on recursion depth (default 10).
+
+    Returns:
+        Dictionary with the InfoArea, a flat list of all objects found (with
+        the sub-area each was found in), a per-type count summary, and the list
+        of sub-areas encountered.
+    """
+    conn = BWConnection.from_env()
+
+    all_objects = []
+    all_sub_areas = []
+    visited = set()
+
+    def _walk(area: str, depth: int):
+        if area in visited or depth > max_depth:
+            return
+        visited.add(area)
+        try:
+            sub_areas, objects = _fetch_infoarea_node(conn, area)
+        except requests.exceptions.HTTPError:
+            return
+        for obj in objects:
+            obj_with_area = dict(obj)
+            obj_with_area["infoArea"] = area
+            all_objects.append(obj_with_area)
+        for sub in sub_areas:
+            all_sub_areas.append({"name": sub["name"], "description": sub["description"], "parent": area})
+            if recursive:
+                _walk(sub["name"], depth + 1)
+
+    _walk(info_area, 0)
+
+    type_counts = {}
+    for obj in all_objects:
+        type_counts[obj["type"]] = type_counts.get(obj["type"], 0) + 1
+
+    return {
+        "infoArea": info_area,
+        "recursive": recursive,
+        "objectCount": len(all_objects),
+        "typeCounts": type_counts,
+        "subAreas": all_sub_areas,
+        "objects": all_objects,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
