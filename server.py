@@ -1030,12 +1030,106 @@ def _extract_abap_routines(program_source: str) -> list[dict]:
     return routines
 
 
+def _trfn_localname(tag: str) -> str:
+    return tag.split("}")[-1] if "}" in tag else tag
+
+
+def _trfn_step_type(step) -> str:
+    """Return the readable step type of a rule <step> element.
+
+    Prefers the explicit ``type`` attribute (DIRECT, CONSTANT, NO_UPDATE,
+    ROUTINE, FORMULA, ...); falls back to the xsi:type local name
+    (e.g. StepDirect -> Direct) when ``type`` is absent.
+    """
+    explicit = step.get("type", "")
+    if explicit:
+        return explicit
+    xsi = step.get("{http://www.w3.org/2001/XMLSchema-instance}type", "")
+    local = xsi.split(":")[-1] if ":" in xsi else xsi
+    return local[4:] if local.startswith("Step") else local
+
+
+def _elementref_field(container) -> str:
+    """Extract the field name from a rule's <source>/<target> elementRef.
+
+    The reference looks like ``#///target/segment1/0CUSTOMER``; the field is
+    the last path segment. Returns "" when no elementRef is present.
+    """
+    if container is None:
+        return ""
+    for child in container:
+        if _trfn_localname(child.tag) == "elementRef" and child.text:
+            return child.text.rsplit("/", 1)[-1]
+    return ""
+
+
+def _parse_transformation_mappings(root, include_no_update: bool = False) -> list[dict]:
+    """Parse the field-level mapping rules from a transformation model.
+
+    Walks each rule group and returns one compact entry per rule:
+      - target:    the target field (from the rule's target elementRef)
+      - source:    the source field(s) (from source elementRefs), when present
+      - stepType:  DIRECT / CONSTANT / NO_UPDATE / ROUTINE / FORMULA / ...
+      - constant:  the constant value (only for CONSTANT steps)
+      - group:     the rule group description (e.g. "Rules", "Technical Rules")
+
+    NO_UPDATE rules (fields the transformation deliberately does not write) are
+    omitted by default to keep the list focused on actual mappings; set
+    ``include_no_update`` to include them.
+    """
+    mappings: list[dict] = []
+    for group in root.iter():
+        if _trfn_localname(group.tag) != "group":
+            continue
+        group_desc = group.get("description", "")
+        for rule in group:
+            if _trfn_localname(rule.tag) != "rule":
+                continue
+
+            target_field = ""
+            source_fields = []
+            for child in rule:
+                lname = _trfn_localname(child.tag)
+                if lname == "target":
+                    target_field = _elementref_field(child)
+                elif lname == "source":
+                    src = _elementref_field(child)
+                    if src:
+                        source_fields.append(src)
+
+            step = None
+            for child in rule:
+                if _trfn_localname(child.tag) == "step":
+                    step = child
+                    break
+            step_type = _trfn_step_type(step) if step is not None else ""
+
+            if step_type == "NO_UPDATE" and not include_no_update:
+                continue
+
+            entry: dict = {"target": target_field, "stepType": step_type}
+            if source_fields:
+                entry["source"] = (
+                    source_fields[0] if len(source_fields) == 1 else source_fields
+                )
+            if step is not None and step.get("constant") is not None:
+                entry["constant"] = step.get("constant")
+            if group_desc:
+                entry["group"] = group_desc
+            mappings.append(entry)
+
+    return mappings
+
+
 @mcp.tool
 def get_transformation_details(
     transformation_id: str,
     include_abap_code: bool = True,
     include_full_program: bool = False,
     include_raw_xml: bool = False,
+    rule_filter: str = "",
+    include_mappings: bool = True,
+    include_no_update_mappings: bool = False,
 ) -> dict:
     """
     Get detailed metadata for a transformation including source, target,
@@ -1065,18 +1159,46 @@ def get_transformation_details(
             enough. Only takes effect when ``include_abap_code`` is True.
         include_raw_xml: If True, include the full transformation model XML
             under ``rawXml``. Defaults to False to keep the response small.
+        rule_filter: If set, narrows the response to the matching field
+            (case-insensitive substring), on both the mappings and the ABAP
+            routines:
+              - ``mappings``: keeps entries whose target field or any source
+                field contains the substring (e.g. "BUYGRP" returns just that
+                field's mapping). ``mappingTotal`` still reports the full count.
+              - ``abapRoutines``: keeps routines whose method name or target
+                field matches, and reports ``abapRoutineCount`` (matched) and
+                ``abapRoutineTotal`` (available).
+            Use it for field-level lineage - e.g. "which field feeds BUYGRP".
+            The mappings filter applies whenever include_mappings is on; the
+            routine filter applies only when include_abap_code is on.
+        include_mappings: If True (default), parse the field-level mapping
+            rules from the model into a compact ``mappings`` list - one entry
+            per rule with target field, source field(s), step type (DIRECT,
+            CONSTANT, NO_UPDATE, ROUTINE, ...) and constant value where
+            relevant. This is the cheap way to see the field mappings without
+            dumping the whole model via include_raw_xml.
+        include_no_update_mappings: If True, also include NO_UPDATE rules
+            (fields the transformation deliberately does not write) in the
+            ``mappings`` list. Defaults to False so the list focuses on actual
+            mappings. Only takes effect when include_mappings is True.
 
     Returns:
         Dictionary with transformation details (source, target, rules). When
-        ABAP code is included, adds:
+        include_mappings is on (default), adds:
+          - mappingCount: number of mapping entries returned
+          - mappingTotal: total rules in the model (before NO_UPDATE filtering)
+          - mappings: compact per-rule mapping list (see include_mappings)
+        When ABAP code is included, adds:
           - abapProgram: the generated program name
           - abapRoutines: list of routine methods, each with method name,
-            target field (if known), line span, and code
+            target field (if known), line span, and code (filtered by
+            rule_filter when provided)
           - abapProgramSource: the full generated program source (only when
             include_full_program is True)
-        With include_raw_xml=True, also adds ``rawXml``. If the ABAP retrieval
-        fails, an ``abapCodeError`` entry explains why while the model metadata
-        is still returned.
+        With include_raw_xml=True, also adds ``rawXml`` (the full model XML;
+        redundant with mappings and much larger - avoid unless you need the raw
+        model). If the ABAP retrieval fails, an ``abapCodeError`` entry
+        explains why while the model metadata is still returned.
     """
     conn = BWConnection.from_env()
     path = f"/sap/bw/modeling/trfn/{transformation_id}"
@@ -1103,6 +1225,30 @@ def get_transformation_details(
             clean_key = key.split("}")[-1] if "}" in key else key
             details[clean_key] = value
 
+        # Parse the compact field-level mapping list from the rule groups.
+        if include_mappings:
+            all_mappings = _parse_transformation_mappings(root, include_no_update=True)
+            if include_no_update_mappings:
+                mappings = all_mappings
+            else:
+                mappings = [m for m in all_mappings if m.get("stepType") != "NO_UPDATE"]
+            details["mappingTotal"] = len(all_mappings)
+            # rule_filter also narrows the mappings: keep entries whose target
+            # or any source field contains the (case-insensitive) substring.
+            if rule_filter:
+                needle = rule_filter.lower()
+
+                def _mapping_matches(m: dict) -> bool:
+                    if needle in m.get("target", "").lower():
+                        return True
+                    src = m.get("source", "")
+                    src_list = src if isinstance(src, list) else [src]
+                    return any(needle in (s or "").lower() for s in src_list)
+
+                mappings = [m for m in mappings if _mapping_matches(m)]
+            details["mappingCount"] = len(mappings)
+            details["mappings"] = mappings
+
     except requests.exceptions.HTTPError as e:
         return {
             "error": f"HTTP {e.response.status_code}: {e.response.reason}",
@@ -1120,7 +1266,20 @@ def get_transformation_details(
         else:
             try:
                 source = _fetch_abap_program_source(conn, program_name)
-                details["abapRoutines"] = _extract_abap_routines(source)
+                routines = _extract_abap_routines(source)
+                if rule_filter:
+                    needle = rule_filter.lower()
+                    matched = [
+                        r
+                        for r in routines
+                        if needle in r.get("method", "").lower()
+                        or needle in r.get("targetField", "").lower()
+                    ]
+                    details["abapRoutineTotal"] = len(routines)
+                    details["abapRoutineCount"] = len(matched)
+                    details["abapRoutines"] = matched
+                else:
+                    details["abapRoutines"] = routines
                 if include_full_program:
                     details["abapProgramSource"] = source
             except requests.exceptions.HTTPError as e:
@@ -1211,37 +1370,79 @@ def _parse_range_boundary(elem, variables: dict) -> dict:
     if var_child is not None and var_child.text:
         uid = var_child.text.strip()
         var = variables.get(uid, {})
-        return {
+        boundary = {
             "isVariable": True,
             "variableName": var.get("technicalName", "")
             or (value_child.text.strip() if value_child is not None and value_child.text else ""),
-            "variableDescription": var.get("description", ""),
-            "valueType": type_child.text.strip() if type_child is not None and type_child.text else "",
         }
+        # Only emit description / value type when they carry information.
+        if var.get("description"):
+            boundary["variableDescription"] = var["description"]
+        value_type = (
+            type_child.text.strip() if type_child is not None and type_child.text else ""
+        )
+        if value_type:
+            boundary["valueType"] = value_type
+        return boundary
 
     # Literal boundary: prefer internalValue attr, else <value> child text
     internal = elem.get("internalValue")
     literal = internal
     if not literal and value_child is not None and value_child.text:
         literal = value_child.text.strip()
-    return {"isVariable": False, "value": literal or ""}
+    if not literal:
+        return {}
+    return {"isVariable": False, "value": literal}
 
 
 def _parse_range_token(token, variables: dict) -> dict:
-    """Parse a SelectionRange token into a readable restriction dict."""
+    """Parse a SelectionRange token into a compact readable restriction dict.
+
+    Low-value / empty fields are omitted to keep the payload small:
+      - default operator "Equal" and default selectionType "range" are dropped
+      - exclude is emitted only when true
+      - empty descriptions and empty boundaries are dropped
+      - a single-value equality range collapses to {"eq": <value>, ...}
+        instead of separate from/to boundary objects
+    """
+    operator = token.get("operator", "")
+    selection_type = token.get("selectionType", "")
+    exclude = token.get("exclude", "false") == "true"
+    from_desc = token.get("fromValueDesc", "")
+    to_desc = token.get("toValueDesc", "")
+
     from_b = _parse_range_boundary(token.find("Qry:fromValue", QRY_NS), variables)
     to_b = _parse_range_boundary(token.find("Qry:toValue", QRY_NS), variables)
 
-    result = {
-        "kind": "range",
-        "operator": token.get("operator", ""),
-        "exclude": token.get("exclude", "false") == "true",
-        "selectionType": token.get("selectionType", ""),
-        "fromValueDesc": token.get("fromValueDesc", ""),
-        "toValueDesc": token.get("toValueDesc", ""),
-        "from": from_b,
-        "to": to_b,
-    }
+    result: dict = {"kind": "range"}
+
+    # Collapse a plain single-value literal equality into a compact form.
+    is_single_value = (
+        operator in ("", "Equal")
+        and from_b
+        and not from_b.get("isVariable")
+        and not to_b
+    )
+    if is_single_value:
+        result["eq"] = from_b.get("value", "")
+        if from_desc:
+            result["desc"] = from_desc
+    else:
+        if operator and operator != "Equal":
+            result["operator"] = operator
+        if from_b:
+            result["from"] = from_b
+        if to_b:
+            result["to"] = to_b
+        if from_desc:
+            result["fromValueDesc"] = from_desc
+        if to_desc:
+            result["toValueDesc"] = to_desc
+
+    if exclude:
+        result["exclude"] = True
+    if selection_type and selection_type != "range":
+        result["selectionType"] = selection_type
 
     # Capture shift/offset for variable-based date/period ranges when present
     if token.get("fromShift"):
@@ -1256,15 +1457,23 @@ def _parse_variable_token(token, variables: dict) -> dict:
     """Parse a SelectionVariable token, resolving the variable reference."""
     uid = token.get("variable", "")
     var = variables.get(uid, {})
-    return {
+    result: dict = {
         "kind": "variable",
-        "operator": token.get("operator", ""),
-        "exclude": token.get("exclude", "false") == "true",
-        "selectionType": token.get("selectionType", ""),
         "variableName": var.get("technicalName", ""),
-        "variableDescription": var.get("description", ""),
-        "variableProcType": var.get("procType", ""),
     }
+    operator = token.get("operator", "")
+    if operator and operator != "Equal":
+        result["operator"] = operator
+    if token.get("exclude", "false") == "true":
+        result["exclude"] = True
+    selection_type = token.get("selectionType", "")
+    if selection_type and selection_type != "variable":
+        result["selectionType"] = selection_type
+    if var.get("description"):
+        result["variableDescription"] = var["description"]
+    if var.get("procType"):
+        result["variableProcType"] = var["procType"]
+    return result
 
 
 def _parse_selection_tokens(selection, variables: dict) -> list:
@@ -1295,13 +1504,13 @@ def _parse_member_groups(member, variables: dict) -> list:
         restrictions = _parse_selection_tokens(group, variables)
         if not restrictions:
             continue
-        groups.append(
-            {
-                "infoObject": group.get("infoObject", ""),
-                "description": group.get("description", ""),
-                "restrictions": restrictions,
-            }
-        )
+        entry = {
+            "infoObject": group.get("infoObject", ""),
+            "restrictions": restrictions,
+        }
+        if group.get("description"):
+            entry["description"] = group["description"]
+        groups.append(entry)
     return groups
 
 
@@ -1460,7 +1669,12 @@ def _parse_query_details(xml_text: str) -> dict:
 
 
 @mcp.tool
-def get_query_filters(query_name: str, object_version: str = "A") -> dict:
+def get_query_filters(
+    query_name: str,
+    object_version: str = "A",
+    section: str = "all",
+    name_filter: str = "",
+) -> dict:
     """
     Read the filter restrictions defined on a BW Query.
 
@@ -1480,12 +1694,27 @@ def get_query_filters(query_name: str, object_version: str = "A") -> dict:
         override at runtime (e.g. 0CUST_GROUP = 05, 13, ...).
       - "Fixed Filter + Default Value" (asStartValueAndFilter): used as both.
 
+    Both this tool and the underlying query model can be large. Use ``section``
+    and ``name_filter`` to fetch only the part you need instead of everything.
+
     Args:
         query_name: Query technical name (e.g. "B080_V05_Q001").
         object_version: Object version, "A" (active, default) or "M" (modified).
+        section: Which part(s) to return. One of:
+            "all" (default) - filters + restricted key figures + structure
+            members; "filters"; "restricted_key_figures" (alias "rkf");
+            "structure_members". Sections not requested are omitted from the
+            response (their count fields are omitted too).
+        name_filter: Case-insensitive substring. When set, restricted key
+            figures and structure members are limited to those whose technical
+            name or description matches. Lets you fetch one RKF (e.g.
+            "B080_V05_R001") instead of all of them. Does not filter the global
+            ``filters`` list (those are keyed by InfoObject, returned as-is for
+            the requested section).
 
     Returns:
-        Dictionary with the query name, InfoProvider, and:
+        Dictionary with the query name, InfoProvider, and the requested
+        section(s):
           - filters: the global query filter. Each entry has the InfoObject,
             usageType, filterType (BEx label), and its restrictions (fixed
             ranges with values, or resolved variables).
@@ -1495,6 +1724,8 @@ def get_query_filters(query_name: str, object_version: str = "A") -> dict:
           - structureMembers: local structure members (rows/columns) that
             carry selection restrictions, with description and restrictions.
             Pure formula members (no restriction) are omitted.
+        When name_filter is set, ``restrictedKeyFigureTotal`` /
+        ``structureMemberTotal`` report how many existed before filtering.
     """
     conn = BWConnection.from_env()
     version = (object_version or "A").upper()
@@ -1524,89 +1755,135 @@ def get_query_filters(query_name: str, object_version: str = "A") -> dict:
     if query_elem is None:
         return {"error": "Query component not found in response", "query": query_name}
 
+    # Normalise the requested section(s).
+    section_norm = (section or "all").strip().lower()
+    _section_aliases = {"rkf": "restricted_key_figures", "rkfs": "restricted_key_figures"}
+    section_norm = _section_aliases.get(section_norm, section_norm)
+    valid_sections = {"all", "filters", "restricted_key_figures", "structure_members"}
+    if section_norm not in valid_sections:
+        return {
+            "error": (
+                f"Invalid section '{section}'. Valid: filters, "
+                "restricted_key_figures, structure_members, all."
+            ),
+            "query": query_name,
+        }
+    want_filters = section_norm in ("all", "filters")
+    want_rkf = section_norm in ("all", "restricted_key_figures")
+    want_members = section_norm in ("all", "structure_members")
+
+    needle = name_filter.strip().lower()
+
+    def _name_matches(*texts: str) -> bool:
+        if not needle:
+            return True
+        return any(needle in (t or "").lower() for t in texts)
+
     variables = _build_variable_map(root)
 
-    # Find the global <filter> child of the query
-    filter_elem = None
-    for child in list(query_elem):
-        if _qry_localname(child.tag) == "filter":
-            filter_elem = child
-            break
-
-    filters = []
-    if filter_elem is not None:
-        for selection in filter_elem.findall("Qry:selections", QRY_NS):
-            if _xsi_type(selection) != "StandardFilterSelection":
-                continue
-            restrictions = _parse_selection_tokens(selection, variables)
-            # Only report characteristics that actually carry a restriction
-            if not restrictions:
-                continue
-            usage_type = selection.get("usageType", "")
-            filters.append(
-                {
-                    "infoObject": selection.get("infoObject", ""),
-                    "usageType": usage_type,
-                    "filterType": _FILTER_TYPE_LABELS.get(usage_type, usage_type),
-                    "restrictions": restrictions,
-                }
-            )
-
-    # Restricted key figures: reusable RestrictedMeasure components, each
-    # carrying a MemberSelection with the characteristic restrictions.
-    restricted_key_figures = []
-    for elem in root.iter():
-        if _xsi_type(elem) != "RestrictedMeasure":
-            continue
-        member = elem.find("Qry:member", QRY_NS)
-        groups = _parse_member_groups(member, variables) if member is not None else []
-        restricted_key_figures.append(
-            {
-                "technicalName": elem.get("technicalName", ""),
-                "description": _member_description(elem)
-                or (
-                    elem.find("Qry:description", QRY_NS).get("value", "")
-                    if elem.find("Qry:description", QRY_NS) is not None
-                    else ""
-                ),
-                "reusable": elem.get("reusable", "false") == "true",
-                "restrictions": groups,
-            }
-        )
-
-    # Structure members: local (non-reusable) selection members defined inside
-    # a structure/CustomDimension (rows or columns). Only report members that
-    # carry actual selection restrictions (skip pure formulas/empty members).
-    # Members belonging to a RestrictedMeasure are excluded (reported above).
-    parent_map = {c: p for p in root.iter() for c in p}
-    structure_members = []
-    for elem in root.iter():
-        if _xsi_type(elem) != "MemberSelection":
-            continue
-        parent = parent_map.get(elem)
-        if parent is not None and _xsi_type(parent) == "RestrictedMeasure":
-            continue  # already covered as a restricted key figure
-        groups = _parse_member_groups(elem, variables)
-        if not groups:
-            continue  # no real restriction (e.g. formula member)
-        structure_members.append(
-            {
-                "description": _member_description(elem),
-                "restrictions": groups,
-            }
-        )
-
-    return {
+    result: dict = {
         "query": query_elem.get("technicalName", query_name),
         "infoProvider": query_elem.get("providerName", ""),
         "objectVersion": version,
-        "filterCount": len(filters),
-        "filters": filters,
-        "restrictedKeyFigureCount": len(restricted_key_figures),
-        "restrictedKeyFigures": restricted_key_figures,
-        "structureMemberCount": len(structure_members),
-        "structureMembers": structure_members,
     }
+
+    if want_filters:
+        # Find the global <filter> child of the query
+        filter_elem = None
+        for child in list(query_elem):
+            if _qry_localname(child.tag) == "filter":
+                filter_elem = child
+                break
+
+        filters = []
+        if filter_elem is not None:
+            for selection in filter_elem.findall("Qry:selections", QRY_NS):
+                if _xsi_type(selection) != "StandardFilterSelection":
+                    continue
+                restrictions = _parse_selection_tokens(selection, variables)
+                # Only report characteristics that actually carry a restriction
+                if not restrictions:
+                    continue
+                usage_type = selection.get("usageType", "")
+                filters.append(
+                    {
+                        "infoObject": selection.get("infoObject", ""),
+                        "usageType": usage_type,
+                        "filterType": _FILTER_TYPE_LABELS.get(usage_type, usage_type),
+                        "restrictions": restrictions,
+                    }
+                )
+        result["filterCount"] = len(filters)
+        result["filters"] = filters
+
+    if want_rkf:
+        # Restricted key figures: reusable RestrictedMeasure components, each
+        # carrying a MemberSelection with the characteristic restrictions.
+        restricted_key_figures = []
+        rkf_total = 0
+        for elem in root.iter():
+            if _xsi_type(elem) != "RestrictedMeasure":
+                continue
+            rkf_total += 1
+            member = elem.find("Qry:member", QRY_NS)
+            groups = (
+                _parse_member_groups(member, variables) if member is not None else []
+            )
+            desc = _member_description(elem) or (
+                elem.find("Qry:description", QRY_NS).get("value", "")
+                if elem.find("Qry:description", QRY_NS) is not None
+                else ""
+            )
+            tech_name = elem.get("technicalName", "")
+            if not _name_matches(tech_name, desc):
+                continue
+            restricted_key_figures.append(
+                {
+                    "technicalName": tech_name,
+                    "description": desc,
+                    "reusable": elem.get("reusable", "false") == "true",
+                    "restrictions": groups,
+                }
+            )
+        result["restrictedKeyFigureCount"] = len(restricted_key_figures)
+        if needle:
+            result["restrictedKeyFigureTotal"] = rkf_total
+        result["restrictedKeyFigures"] = restricted_key_figures
+
+    if want_members:
+        # Structure members: local (non-reusable) selection members defined
+        # inside a structure/CustomDimension (rows or columns). Only report
+        # members that carry actual selection restrictions (skip pure formulas/
+        # empty members). Members belonging to a RestrictedMeasure are excluded
+        # (reported as restricted key figures).
+        parent_map = {c: p for p in root.iter() for c in p}
+        structure_members = []
+        member_total = 0
+        for elem in root.iter():
+            if _xsi_type(elem) != "MemberSelection":
+                continue
+            parent = parent_map.get(elem)
+            if parent is not None and _xsi_type(parent) == "RestrictedMeasure":
+                continue  # already covered as a restricted key figure
+            groups = _parse_member_groups(elem, variables)
+            if not groups:
+                continue  # no real restriction (e.g. formula member)
+            member_total += 1
+            desc = _member_description(elem)
+            if not _name_matches(desc):
+                continue
+            structure_members.append(
+                {
+                    "description": desc,
+                    "restrictions": groups,
+                }
+            )
+        result["structureMemberCount"] = len(structure_members)
+        if needle:
+            result["structureMemberTotal"] = member_total
+        result["structureMembers"] = structure_members
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1896,7 +2173,9 @@ def _get_dtp_endpoints(dtp_id: str) -> dict:
 
 
 @mcp.tool
-def get_data_flow(object_name: str, object_type: str = "IOBJ") -> dict:
+def get_data_flow(
+    object_name: str, object_type: str = "IOBJ", section: str = "all"
+) -> dict:
     """
     Show the data flow (lineage) around a BW object: what feeds INTO it and
     what it feeds OUT to, via transformations and their DataSources.
@@ -1907,12 +2186,29 @@ def get_data_flow(object_name: str, object_type: str = "IOBJ") -> dict:
     transformations whose source is a DataSource, the DataSource name and
     source system are resolved.
 
+    The full response can be large - the DTP sections in particular repeat
+    status and process-chain details for every DTP, and resolving them costs
+    one extra request per DTP. Use ``section`` to fetch only the part you need;
+    when no DTP section is requested, the per-DTP resolution is skipped
+    entirely (faster as well as smaller). To answer "which transformations
+    target/read object X", use section "transformations" (or "inbound" /
+    "outbound").
+
     Args:
         object_name: Technical name of the object (e.g. "0COSTCENTER").
         object_type: Object type code (default "IOBJ"). Also e.g. ADSO, HCPR.
+        section: Which part(s) to return. One of:
+            "all" (default) - transformations + DTPs, both directions;
+            "transformations" - inbound + outbound transformations only;
+            "inbound" - inbound transformations only;
+            "outbound" - outbound transformations only;
+            "dtps" - inbound + outbound DTPs only;
+            "inbound_dtps" - inbound DTPs only;
+            "outbound_dtps" - outbound DTPs only.
+            Sections not requested are omitted (their count fields too).
 
     Returns:
-        Dictionary with:
+        Dictionary with the requested section(s):
           - inbound: transformations that load INTO the object (target = it),
             each with transformationId, source (dataSource/sourceSystem/type),
             and target subType (ATTR/TEXT/HIER for InfoObjects).
@@ -1928,6 +2224,32 @@ def get_data_flow(object_name: str, object_type: str = "IOBJ") -> dict:
     usageInProcessChains section), so each DTP entry lists the process chains
     that execute it.
     """
+    section_norm = (section or "all").strip().lower()
+    valid_sections = {
+        "all",
+        "transformations",
+        "inbound",
+        "outbound",
+        "dtps",
+        "inbound_dtps",
+        "outbound_dtps",
+    }
+    if section_norm not in valid_sections:
+        return {
+            "error": (
+                f"Invalid section '{section}'. Valid: all, transformations, "
+                "inbound, outbound, dtps, inbound_dtps, outbound_dtps."
+            ),
+            "object": object_name,
+        }
+
+    want_inbound_trfn = section_norm in ("all", "transformations", "inbound")
+    want_outbound_trfn = section_norm in ("all", "transformations", "outbound")
+    want_inbound_dtp = section_norm in ("all", "dtps", "inbound_dtps")
+    want_outbound_dtp = section_norm in ("all", "dtps", "outbound_dtps")
+    want_any_trfn = want_inbound_trfn or want_outbound_trfn
+    want_any_dtp = want_inbound_dtp or want_outbound_dtp
+
     conn = BWConnection.from_env()
     NS = {
         "atom": "http://www.w3.org/2005/Atom",
@@ -1969,65 +2291,87 @@ def get_data_flow(object_name: str, object_type: str = "IOBJ") -> dict:
 
     target_name_upper = object_name.upper()
 
-    inbound = []
-    outbound = []
-    for tid in transformation_ids:
-        endpoints = _get_transformation_endpoints(tid)
-        src = endpoints.get("source", {})
-        tgt = endpoints.get("target", {})
-        if tgt.get("name", "").upper() == target_name_upper:
-            inbound.append(
-                {
-                    "transformationId": tid,
-                    "source": src,
-                    "targetSubType": tgt.get("subType", ""),
-                }
-            )
-        elif src.get("name", "").upper().startswith(target_name_upper):
-            outbound.append(
-                {
-                    "transformationId": tid,
-                    "target": tgt,
-                }
-            )
+    result: dict = {
+        "object": object_name,
+        "objectType": object_type.upper(),
+    }
+
+    # Resolve transformation endpoints only if a transformation section is
+    # requested (each resolution is a separate request).
+    if want_any_trfn:
+        inbound = []
+        outbound = []
+        for tid in transformation_ids:
+            endpoints = _get_transformation_endpoints(tid)
+            src = endpoints.get("source", {})
+            tgt = endpoints.get("target", {})
+            if tgt.get("name", "").upper() == target_name_upper:
+                if want_inbound_trfn:
+                    inbound.append(
+                        {
+                            "transformationId": tid,
+                            "source": src,
+                            "targetSubType": tgt.get("subType", ""),
+                        }
+                    )
+            elif src.get("name", "").upper().startswith(target_name_upper):
+                if want_outbound_trfn:
+                    outbound.append({"transformationId": tid, "target": tgt})
+
+        if want_inbound_trfn:
+            result["inboundCount"] = len(inbound)
+            result["inbound"] = inbound
+        if want_outbound_trfn:
+            result["outboundCount"] = len(outbound)
+            result["outbound"] = outbound
 
     # Split DTPs by direction using each DTP's actual source/target, and
     # attach the DTP's status. A DTP is inbound when its target is this object.
-    inbound_dtps = []
-    outbound_dtps = []
-    for dtp in dtp_names:
-        endpoints = _get_dtp_endpoints(dtp)
-        if not endpoints:
-            continue
-        src = endpoints.get("source", {})
-        tgt = endpoints.get("target", {})
-        status = {
-            "objectStatus": endpoints.get("objectStatus", ""),
-            "contentState": endpoints.get("contentState", ""),
-            "version": endpoints.get("version", ""),
-        }
-        process_chains = endpoints.get("processChains", [])
-        if tgt.get("name", "").upper() == target_name_upper:
-            inbound_dtps.append(
-                {"dtp": dtp, "source": src, "status": status, "processChains": process_chains}
-            )
-        elif src.get("name", "").upper().startswith(target_name_upper):
-            outbound_dtps.append(
-                {"dtp": dtp, "target": tgt, "status": status, "processChains": process_chains}
-            )
+    # Skip the per-DTP resolution entirely when no DTP section is requested.
+    if want_any_dtp:
+        inbound_dtps = []
+        outbound_dtps = []
+        for dtp in dtp_names:
+            endpoints = _get_dtp_endpoints(dtp)
+            if not endpoints:
+                continue
+            src = endpoints.get("source", {})
+            tgt = endpoints.get("target", {})
+            status = {
+                "objectStatus": endpoints.get("objectStatus", ""),
+                "contentState": endpoints.get("contentState", ""),
+                "version": endpoints.get("version", ""),
+            }
+            process_chains = endpoints.get("processChains", [])
+            if tgt.get("name", "").upper() == target_name_upper:
+                if want_inbound_dtp:
+                    inbound_dtps.append(
+                        {
+                            "dtp": dtp,
+                            "source": src,
+                            "status": status,
+                            "processChains": process_chains,
+                        }
+                    )
+            elif src.get("name", "").upper().startswith(target_name_upper):
+                if want_outbound_dtp:
+                    outbound_dtps.append(
+                        {
+                            "dtp": dtp,
+                            "target": tgt,
+                            "status": status,
+                            "processChains": process_chains,
+                        }
+                    )
 
-    return {
-        "object": object_name,
-        "objectType": object_type.upper(),
-        "inboundCount": len(inbound),
-        "inbound": inbound,
-        "outboundCount": len(outbound),
-        "outbound": outbound,
-        "inboundDataTransferProcessCount": len(inbound_dtps),
-        "inboundDataTransferProcesses": inbound_dtps,
-        "outboundDataTransferProcessCount": len(outbound_dtps),
-        "outboundDataTransferProcesses": outbound_dtps,
-    }
+        if want_inbound_dtp:
+            result["inboundDataTransferProcessCount"] = len(inbound_dtps)
+            result["inboundDataTransferProcesses"] = inbound_dtps
+        if want_outbound_dtp:
+            result["outboundDataTransferProcessCount"] = len(outbound_dtps)
+            result["outboundDataTransferProcesses"] = outbound_dtps
+
+    return result
 
 
 # ---------------------------------------------------------------------------
