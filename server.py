@@ -709,23 +709,122 @@ def get_adso_fields(object_name: str) -> list[dict]:
     return fields
 
 
-@mcp.tool
-def get_composite_provider_parts(object_name: str) -> list[dict]:
+def _hcpr_local(tag: str) -> str:
+    return tag.split("}")[-1] if "}" in tag else tag
+
+
+def _hcpr_xsi(elem) -> str:
+    v = elem.get("{http://www.w3.org/2001/XMLSchema-instance}type", "")
+    return v.split(":")[-1] if ":" in v else v
+
+
+def _hcpr_ref_target(ref: str) -> str:
+    """Return the last path segment of a join input reference.
+
+    Join input refs look like ``#///J1/J1.ADSO.1`` (a source alias) or
+    ``#///J2/J1`` (another join node's name). The meaningful token is the last
+    path segment.
     """
-    Get the part providers (data sources) of a CompositeProvider.
+    return ref.rsplit("/", 1)[-1] if ref else ""
+
+
+def _parse_hcpr_join_conditions(root, alias_to_name: dict) -> list[dict]:
+    """Parse the Join node conditions from a CompositeProvider model.
+
+    Each join <viewNode> (xsi:type View:JoinNode) contains <join> elements with
+    joinType / cardinality / leftInput / rightInput attributes and paired
+    <leftElementName> / <rightElementName> children (the ON-condition column
+    pairs). Returns one entry per join with its node, sides (resolved to the
+    underlying provider name where the input is a source alias), and the list
+    of field pairs.
+    """
+    parent = {c: p for p in root.iter() for c in p}
+    conditions = []
+
+    def _resolve_side(ref: str) -> dict:
+        token = _hcpr_ref_target(ref)
+        side = {"alias": token}
+        name = alias_to_name.get(token, "")
+        # Attach provider only for a real underlying source (where the mapped
+        # name differs from the alias). A nested join node maps to itself
+        # (alias == name, e.g. "J1"), so leave provider out and flag it.
+        if name and name != token:
+            side["provider"] = name
+        else:
+            side["isNestedNode"] = True
+        return side
+
+    for node in root.iter():
+        if _hcpr_local(node.tag) != "viewNode" or _hcpr_xsi(node) != "JoinNode":
+            continue
+        node_name = node.get("name", "")
+        for j in node:
+            if _hcpr_local(j.tag) != "join":
+                continue
+            lefts = [
+                c.text
+                for c in j
+                if _hcpr_local(c.tag) == "leftElementName" and c.text
+            ]
+            rights = [
+                c.text
+                for c in j
+                if _hcpr_local(c.tag) == "rightElementName" and c.text
+            ]
+            field_pairs = [
+                {"left": l, "right": r} for l, r in zip(lefts, rights)
+            ]
+            conditions.append(
+                {
+                    "node": node_name,
+                    "joinType": j.get("joinType", ""),
+                    "cardinality": j.get("cardinality", ""),
+                    "leftSide": _resolve_side(j.get("leftInput", "")),
+                    "rightSide": _resolve_side(j.get("rightInput", "")),
+                    "on": field_pairs,
+                }
+            )
+    return conditions
+
+
+@mcp.tool
+def get_composite_provider_parts(
+    object_name: str, include_join_conditions: bool = True
+) -> dict:
+    """
+    Get the part providers (data sources) of a CompositeProvider, and
+    (optionally) the join conditions between them.
 
     A CompositeProvider combines several source InfoProviders (ADSOs,
     InfoObjects, Open ODS Views) via Union or Join nodes. This returns each
-    source (part) provider with the combination type of its parent node.
+    source (part) provider with the combination type of its parent node, plus
+    the ON-conditions of any Join nodes.
 
     Args:
         object_name: Technical name of the CompositeProvider (e.g. "B080_V05").
+        include_join_conditions: If True (default), also return the join
+            conditions under ``joinConditions``. Set to False to get only the
+            part-provider list (e.g. for a pure Union provider with no joins).
 
     Returns:
-        List of part providers, each with:
-          - name: source provider technical name (e.g. an ADSO)
-          - alias: the CompositeProvider's internal alias for the source
-          - combination: "Union" or "Join" (from the parent view node)
+        Dictionary with:
+          - object: the CompositeProvider name
+          - parts: list of part providers, each with name (source provider
+            technical name), alias (the CompositeProvider's internal alias),
+            and combination ("Union" / "JoinNode" / "Aggregation" - from the
+            parent view node).
+          - joinConditions (when include_join_conditions is on): one entry per
+            join, each with:
+              * node: the join node name (e.g. "J1")
+              * joinType: "inner" / "leftOuter" / ...
+              * cardinality: e.g. "C1_N", "CN_1", "CN_N"
+              * leftSide / rightSide: the joined inputs. A source input has
+                {alias, provider} (provider = underlying source name, e.g.
+                B700_D01). A nested join input has {alias, isNestedNode: true}
+                where alias is that join node's name (e.g. "J1"), i.e. the
+                result of a deeper join feeds into this one.
+              * on: list of {left, right} field pairs (the ON condition)
+          - joinConditionCount: number of join conditions (when included)
     """
     conn = BWConnection.from_env()
 
@@ -736,37 +835,41 @@ def get_composite_provider_parts(object_name: str) -> list[dict]:
             conn, path, accept="application/vnd.sap.bw.modeling.hcpr-v1_15_0+xml"
         )
     except requests.exceptions.HTTPError as e:
-        return [{"error": f"HTTP {e.response.status_code}: {e.response.reason}", "object": object_name}]
+        return {
+            "error": f"HTTP {e.response.status_code}: {e.response.reason}",
+            "object": object_name,
+        }
 
     root = ET.fromstring(response.text)
 
-    def _local(tag: str) -> str:
-        return tag.split("}")[-1] if "}" in tag else tag
-
-    def _xsi(elem) -> str:
-        v = elem.get("{http://www.w3.org/2001/XMLSchema-instance}type", "")
-        return v.split(":")[-1] if ":" in v else v
-
     # The CompositeProvider model (Composite:compositeView) nests source
     # providers as <input> elements (xsi:type Composite:CompositeInput) inside
-    # viewNode elements whose xsi:type is View:Union or View:Join.
+    # viewNode elements whose xsi:type is View:Union / View:JoinNode / etc.
     parts = []
+    alias_to_name: dict = {}
     for node in root.iter():
-        if _local(node.tag) != "viewNode":
+        if _hcpr_local(node.tag) != "viewNode":
             continue
-        combination = _xsi(node)  # e.g. "Union" -> from "View:Union"
+        combination = _hcpr_xsi(node)  # e.g. "Union" -> from "View:Union"
         for child in list(node):
-            if _local(child.tag) != "input":
+            if _hcpr_local(child.tag) != "input":
                 continue
+            name = child.get("name", "")
+            alias = child.get("alias", "")
+            if alias:
+                alias_to_name[alias] = name
             parts.append(
-                {
-                    "name": child.get("name", ""),
-                    "alias": child.get("alias", ""),
-                    "combination": combination,
-                }
+                {"name": name, "alias": alias, "combination": combination}
             )
 
-    return parts
+    result: dict = {"object": object_name, "parts": parts}
+
+    if include_join_conditions:
+        join_conditions = _parse_hcpr_join_conditions(root, alias_to_name)
+        result["joinConditionCount"] = len(join_conditions)
+        result["joinConditions"] = join_conditions
+
+    return result
 
 
 @mcp.tool
