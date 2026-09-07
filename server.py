@@ -268,12 +268,18 @@ mcp = FastMCP(
         "     '*' (e.g. 'B080*'); leading wildcards are not supported.\n"
         "  2. Inspect an object with the matching detail tool:\n"
         "     - InfoObject   -> get_infoobject_details (attributes, nav vs\n"
-        "                       display, compounding, data type)\n"
+        "                       display, compounding, data type). For the\n"
+        "                       actual master-data VALUES of a characteristic\n"
+        "                       (e.g. list 0CUSTOMER/0MATERIAL values, optionally\n"
+        "                       restricted to an InfoProvider) use\n"
+        "                       get_characteristic_values.\n"
         "     - ADSO         -> get_adso_fields (field/InfoObject list)\n"
         "     - HCPR         -> get_composite_provider_parts (source providers)\n"
         "     - Query        -> get_query_structure (characteristics, key\n"
         "                       figures, measures) AND get_query_filters\n"
-        "                       (fixed/default filters, restricted key figures)\n"
+        "                       (fixed/default filters, restricted key figures).\n"
+        "                       For the query's actual RESULT DATA (executed\n"
+        "                       figures, not the definition) use read_query_data.\n"
         "     - Transformation -> get_transformation_details\n"
         "     - anything     -> get_object_details (generic metadata)\n"
         "\n"
@@ -970,6 +976,107 @@ def get_infoobject_details(infoobject_name: str) -> dict:
 
 
 @mcp.tool
+def get_characteristic_values(
+    characteristic_name: str,
+    info_provider: str = "",
+    search_string: str = "",
+    max_rows: int = 50,
+    read_texts: bool = True,
+    read_sids: bool = False,
+    most_recent: bool = False,
+) -> dict:
+    """
+    Read the actual master-data VALUES of a characteristic InfoObject.
+
+    Unlike get_infoobject_details (which returns the InfoObject definition),
+    this returns real data rows - the characteristic's values, optionally with
+    their texts. Use it to answer "what are the values of 0CUSTOMER / 0MATERIAL
+    / 0PLANT ...", either across the whole InfoObject's master data or
+    restricted to the values that occur in a given InfoProvider.
+
+    NOTE: This reads characteristic (master-data) values only. It does NOT run
+    a BW query or return query result figures - the BW Modeling API on this
+    system exposes no query-result runtime.
+
+    Args:
+        characteristic_name: Technical name of the characteristic (e.g.
+            "0CUSTOMER", "0SOLD_TO", "0MATERIAL"). Navigation-attribute style
+            names are resolved by the backend to their base characteristic.
+        info_provider: Optional InfoProvider (e.g. "B080_V05") to restrict the
+            values to those actually present in that provider. Leave empty to
+            read the full master data of the InfoObject.
+        search_string: Optional filter pattern applied to the values/texts.
+        max_rows: Maximum number of value rows to return (default: 50).
+        read_texts: If True (default), include the value texts/descriptions.
+        read_sids: If True, also return the internal SIDs (default: False).
+        most_recent: If True, prefer most-recently-used values (default: False).
+
+    Returns:
+        Dictionary with:
+          - characteristic: the requested characteristic name
+          - referenceCharacteristic: the base characteristic the backend
+            resolved it to (e.g. 0SOLD_TO -> 0CUSTOMER), when reported
+          - infoProvider: the InfoProvider filter used (if any)
+          - columns: the value-help column names, in order (e.g. CHAVL_EXT =
+            external/display value, CHAVL_INT = internal key, plus text columns)
+          - rowCount: number of value rows returned
+          - values: list of row dicts keyed by column name
+    """
+    conn = BWConnection.from_env()
+
+    params: dict[str, str] = {
+        "characteristicname": characteristic_name,
+        "maxrows": str(max_rows),
+        "readtexts": "true" if read_texts else "false",
+        "readsids": "true" if read_sids else "false",
+        "mostrecent": "true" if most_recent else "false",
+    }
+    if info_provider:
+        params["infoprovider"] = info_provider
+    if search_string:
+        params["searchstring"] = search_string
+
+    try:
+        response = _bw_request(
+            conn,
+            "/sap/bw/modeling/is/values/characteristicvalues",
+            params=params,
+            accept="application/vnd.sap-bw-modeling.valuehelp2-v1_1_0+xml",
+        )
+    except requests.exceptions.HTTPError as e:
+        return {
+            "error": f"HTTP {e.response.status_code}: {e.response.reason}",
+            "detail": e.response.text[:500],
+            "characteristic": characteristic_name,
+        }
+
+    rows = _parse_value_help(response.text)
+
+    # Pull the reference characteristic from the meta information element, e.g.
+    # <valueHelpMetaInformation referenceCharacteristic="0CUSTOMER" .../>.
+    reference = ""
+    try:
+        root = ET.fromstring(response.text)
+        for elem in root.iter():
+            if elem.tag.split("}")[-1] == "valueHelpMetaInformation":
+                reference = (elem.get("referenceCharacteristic") or "").strip()
+                break
+    except ET.ParseError:
+        pass
+
+    columns = list(rows[0].keys()) if rows else []
+
+    return {
+        "characteristic": characteristic_name,
+        "referenceCharacteristic": reference,
+        "infoProvider": info_provider,
+        "columns": columns,
+        "rowCount": len(rows),
+        "values": rows,
+    }
+
+
+@mcp.tool
 def get_infoarea_contents(
     info_area: str,
     max_results: int = 200,
@@ -1611,8 +1718,9 @@ def _parse_member_groups(member, variables: dict) -> list:
             "infoObject": group.get("infoObject", ""),
             "restrictions": restrictions,
         }
-        if group.get("description"):
-            entry["description"] = group["description"]
+        group_desc = group.get("description")
+        if group_desc:
+            entry["description"] = group_desc
         groups.append(entry)
     return groups
 
@@ -2108,9 +2216,11 @@ def get_query_structure(query_name: str, object_version: str = "A") -> dict:
             desc = _member_description(member)
             if not desc:
                 continue
+            tech_name = member.get("technicalName", "")
             if mtype == "MemberSelection":
                 measures.append(
                     {
+                        "technicalName": tech_name,
                         "description": desc,
                         "measureType": "restricted",
                         "baseKeyFigure": _member_base_key_figure(member),
@@ -2119,6 +2229,7 @@ def get_query_structure(query_name: str, object_version: str = "A") -> dict:
             elif mtype == "MemberFormula":
                 measures.append(
                     {
+                        "technicalName": tech_name,
                         "description": desc,
                         "measureType": "calculated",
                         "formula": _render_formula(member, id_desc),
@@ -2136,6 +2247,286 @@ def get_query_structure(query_name: str, object_version: str = "A") -> dict:
         "measureCount": len(measures),
         "measures": measures,
     }
+
+
+# ---------------------------------------------------------------------------
+# Query data (BICS reporting) tool
+# ---------------------------------------------------------------------------
+
+
+def _bics_local(tag: str) -> str:
+    return tag.split("}")[-1] if "}" in tag else tag
+
+
+def _parse_bics_axis(axis_elem) -> dict:
+    """Parse a BICS <columns> or <rows> axis into headers + member tuples.
+
+    An axis has:
+      - <headers><entry .../></headers>: the dimensions on the axis, in order
+        (characteristics, or a structure like "Key Figures"). Each entry's
+        ``pos`` gives its column index within a tuple.
+      - <tuples size=N><tuple><value .../></tuple>...: the members. Each
+        <tuple> has one <value> per header entry (matched by the header id /
+        order). A value carries extKey (external/display key), intKey (internal
+        key), txt (text), and sid.
+
+    Returns {"drillLevel", "headers": [...], "tuples": [[{...}, ...], ...]}.
+    """
+    if axis_elem is None:
+        return {"headers": [], "tuples": []}
+
+    headers = []
+    tuples = []
+    for child in axis_elem:
+        tag = _bics_local(child.tag)
+        if tag == "headers":
+            for entry in child:
+                if _bics_local(entry.tag) != "entry":
+                    continue
+                headers.append(
+                    {
+                        "name": entry.get("name", ""),
+                        "text": entry.get("txt", ""),
+                        "isStructure": entry.get("isStructure", "") == "true",
+                        "isKeyFigures": entry.get("hasKeyfigures", "") == "true",
+                    }
+                )
+        elif tag == "tuples":
+            for tup in child:
+                if _bics_local(tup.tag) != "tuple":
+                    continue
+                members = []
+                for val in tup:
+                    if _bics_local(val.tag) != "value":
+                        continue
+                    members.append(
+                        {
+                            "key": val.get("extKey", "") or val.get("intKey", ""),
+                            "internalKey": val.get("intKey", ""),
+                            "text": val.get("txt", ""),
+                        }
+                    )
+                tuples.append(members)
+
+    return {
+        "drillLevel": axis_elem.get("drillLvl", ""),
+        "headers": headers,
+        "tuples": tuples,
+    }
+
+
+def _parse_bics_effective_selection(root) -> list[dict]:
+    """Parse the <selection>/<effective> block: the filters actually applied.
+
+    Each <infoObject name=..> holds one or more <selectValue> restrictions with
+    sign (I/E include/exclude), op (EQ/BT/...), and low/high values.
+    """
+    effective = next(
+        (e for e in root.iter() if _bics_local(e.tag) == "effective"), None
+    )
+    if effective is None:
+        return []
+
+    result = []
+    for iobj in effective:
+        if _bics_local(iobj.tag) != "infoObject":
+            continue
+        restrictions = []
+        for sv in iobj:
+            if _bics_local(sv.tag) != "selectValue":
+                continue
+            entry = {
+                "sign": sv.get("sign", ""),
+                "operator": sv.get("op", ""),
+                "low": sv.get("low", "") or sv.get("lowInt", ""),
+            }
+            if sv.get("high") or sv.get("highInt"):
+                entry["high"] = sv.get("high", "") or sv.get("highInt", "")
+            restrictions.append(entry)
+        result.append(
+            {"infoObject": iobj.get("name", ""), "restrictions": restrictions}
+        )
+    return result
+
+
+def _parse_bics_response(xml_text: str) -> dict:
+    """Parse a BICS query-reporting response (<queryView>) into a clean result.
+
+    The response executes the query in its default view and returns:
+      - queryView attributes (name, text, uid, data rollup timestamp)
+      - metaData (InfoProvider, whether the query has variables)
+      - a <resultSet> with <columns> and <rows> axes and a sparse <data> block
+        of <cell row=.. col=.. crv=.. txt=../> entries (crv = raw numeric value,
+        txt = formatted display value). row/col are 1-based indexes into the
+        respective axis tuple lists.
+    """
+    root = ET.fromstring(xml_text)
+
+    result: dict = {
+        "query": root.get("name", ""),
+        "description": root.get("txt", ""),
+        "uid": root.get("uid", ""),
+        "dataRollup": root.get("dataRollup", ""),
+        "isTransient": root.get("isTransient", "") == "true",
+    }
+
+    meta = next((e for e in root.iter() if _bics_local(e.tag) == "metaData"), None)
+    if meta is not None:
+        result["infoProvider"] = meta.get("infoProvider", "")
+        result["infoProviderText"] = meta.get("infoProviderText", "")
+        result["hasVariables"] = meta.get("hasVariables", "") == "true"
+
+    result_set = next(
+        (e for e in root.iter() if _bics_local(e.tag) == "resultSet"), None
+    )
+    if result_set is None:
+        # No data grid was produced. The usual cause is that the query stopped
+        # on its variable-entry screen because a mandatory variable needs a
+        # value (variablesContainer/@inputRequired="true"). Surface the
+        # variables so the caller understands what input is missing, rather
+        # than returning a bare error.
+        var_container = next(
+            (e for e in root.iter() if _bics_local(e.tag) == "variablesContainer"),
+            None,
+        )
+        variables = []
+        input_required = False
+        if var_container is not None:
+            input_required = var_container.get("inputRequired", "") == "true"
+            for var in var_container:
+                if _bics_local(var.tag) != "variable":
+                    continue
+                variables.append(
+                    {
+                        "name": (var.get("altName") or var.get("name", "")).strip(),
+                        "text": var.get("txt", ""),
+                        "infoObject": var.get("iobj", ""),
+                        "mandatory": var.get("mandatory", "") == "true",
+                    }
+                )
+        mandatory = [v["name"] for v in variables if v["mandatory"]]
+        result["hasResultSet"] = False
+        result["inputRequired"] = input_required
+        result["variables"] = variables
+        result["mandatoryVariables"] = mandatory
+        if input_required or mandatory:
+            result["message"] = (
+                "Query did not return data in its default view because it "
+                "requires variable input. This tool runs the default view only "
+                "and does not submit variable values."
+                + (f" Mandatory variables: {', '.join(mandatory)}." if mandatory else "")
+            )
+        else:
+            result["message"] = (
+                "Query executed but returned no result set in its default view."
+            )
+        return result
+
+    result["hasResultSet"] = True
+
+    columns_elem = next(
+        (c for c in result_set if _bics_local(c.tag) == "columns"), None
+    )
+    rows_elem = next(
+        (c for c in result_set if _bics_local(c.tag) == "rows"), None
+    )
+    columns = _parse_bics_axis(columns_elem)
+    rows = _parse_bics_axis(rows_elem)
+
+    # Data cells: sparse list keyed by 1-based row/col into the axis tuples.
+    cells = []
+    data_elem = next(
+        (c for c in result_set if _bics_local(c.tag) == "data"), None
+    )
+    if data_elem is not None:
+        for cell in data_elem:
+            if _bics_local(cell.tag) != "cell":
+                continue
+            raw = cell.get("crv", "")
+            value = None
+            if raw not in ("", None):
+                try:
+                    value = float(raw)
+                except ValueError:
+                    value = raw
+            cells.append(
+                {
+                    "row": int(cell.get("row", "0") or 0),
+                    "col": int(cell.get("col", "0") or 0),
+                    "value": value,
+                    "formatted": cell.get("txt", ""),
+                }
+            )
+
+    result["columns"] = columns
+    result["rows"] = rows
+    result["rowTupleCount"] = len(rows["tuples"])
+    result["columnTupleCount"] = len(columns["tuples"])
+    result["cells"] = cells
+    result["cellCount"] = len(cells)
+    result["effectiveFilters"] = _parse_bics_effective_selection(root)
+    return result
+
+
+@mcp.tool
+def read_query_data(query_name: str) -> dict:
+    """
+    Execute a BW Query and read its RESULT DATA (the numbers), not its design.
+
+    This runs the query in its default initial view via the BW reporting
+    (BICS) runtime and returns the resolved result: the row and column axis
+    members (with keys and texts) and the data cells (raw numeric value plus
+    formatted display value). This is the tool for "what are the actual figures
+    in query X".
+
+    HOW IT DIFFERS from get_query_structure / get_query_filters: those read the
+    query DEFINITION (characteristics, key figures, measures, filters) from the
+    design-time model. This tool EXECUTES the query and returns DATA.
+
+    LIMITATIONS:
+      - Returns the query's DEFAULT view: variables take their default values
+        (no variable entry is supplied) and the drilldown is as the query is
+        saved. Ad-hoc navigation (changing drilldown, passing variable values,
+        filtering) is not supported by this tool.
+      - If the query requires mandatory variable input, the default execution
+        may return little or no data.
+      - The cell list is sparse: only populated cells are returned, addressed
+        by 1-based row/col indexes into the row/column tuple lists.
+
+    Args:
+        query_name: Query technical name (e.g. "B080_V05_Q005").
+
+    Returns:
+        Dictionary with:
+          - query, description, uid, dataRollup (last data load timestamp)
+          - infoProvider, infoProviderText, hasVariables
+          - columns / rows: each with headers (axis dimensions) and tuples
+            (the members; each member has key, internalKey, text)
+          - rowTupleCount / columnTupleCount
+          - cells: list of {row, col, value, formatted} (value = raw number,
+            formatted = display string incl. unit/currency; row/col are 1-based
+            indexes into rows.tuples / columns.tuples)
+          - cellCount
+          - effectiveFilters: the restrictions actually applied at runtime
+            (e.g. fiscal year, fiscal variant), one entry per InfoObject
+    """
+    conn = BWConnection.from_env()
+
+    try:
+        response = _bw_request(
+            conn,
+            "/sap/bw/modeling/comp/reporting",
+            params={"compid": query_name},
+            accept="application/xml",
+        )
+    except requests.exceptions.HTTPError as e:
+        return {
+            "error": f"HTTP {e.response.status_code}: {e.response.reason}",
+            "detail": e.response.text[:500],
+            "query": query_name,
+        }
+
+    return _parse_bics_response(response.text)
 
 
 # ---------------------------------------------------------------------------
@@ -2271,6 +2662,225 @@ def _get_dtp_endpoints(dtp_id: str) -> dict:
                     {"name": name, "description": pc.get("description", "")}
                 )
     result["processChains"] = process_chains
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# DTP details tool
+# ---------------------------------------------------------------------------
+
+# DTP extraction mode codes (extractionSettings/@extractionMode).
+_DTP_EXTRACTION_MODES = {
+    "F": "Full",
+    "D": "Delta",
+    "I": "Initialization (non-cumulative)",
+    "N": "No transfer (init without data)",
+}
+
+# DTP processing mode codes (execution/@processingMode).
+_DTP_PROCESSING_MODES = {
+    "E": "Serial extraction, immediate parallel processing (background)",
+    "P": "Parallel extraction and processing",
+    "S": "Serial in dialog (debug)",
+    "N": "No data transfer",
+}
+
+
+def _dtp_local(tag: str) -> str:
+    return tag.split("}")[-1] if "}" in tag else tag
+
+
+def _parse_dtp_filter_field(field_elem) -> dict:
+    """Parse one <fields> element of a DTP filter into a compact restriction.
+
+    A filtered field carries filterSelection="X" and one or more <selection>
+    children. Each <selection> has an operator (Equal/Between/...) and an
+    excluding flag (true -> Exclude/E, false -> Include/I), with a <low> value
+    and optional <high> value. The <operators> children are UI metadata (the
+    list of available operators) and are ignored.
+    """
+    selections = []
+    for sel in field_elem:
+        if _dtp_local(sel.tag) != "selection":
+            continue
+        low_elem = next((c for c in sel if _dtp_local(c.tag) == "low"), None)
+        high_elem = next((c for c in sel if _dtp_local(c.tag) == "high"), None)
+        excluding = sel.get("excluding", "false") == "true"
+        entry: dict = {
+            "sign": "E" if excluding else "I",
+            "operator": sel.get("operator", ""),
+        }
+        if low_elem is not None and low_elem.get("value") is not None:
+            entry["low"] = low_elem.get("value")
+        if high_elem is not None and high_elem.get("value") is not None:
+            entry["high"] = high_elem.get("value")
+        selections.append(entry)
+    return {
+        "field": field_elem.get("name", ""),
+        "dtaName": field_elem.get("dtaName", ""),
+        "description": field_elem.get("description", ""),
+        "selections": selections,
+    }
+
+
+def _parse_dtp_filters(root) -> list[dict]:
+    """Return the DTP's filter restrictions - one entry per filtered field.
+
+    Only fields that actually carry a selection are returned (fields present
+    in the model purely as filterable candidates are skipped).
+    """
+    filt = next((e for e in root.iter() if _dtp_local(e.tag) == "filter"), None)
+    if filt is None:
+        return []
+    filters = []
+    for field_elem in filt:
+        if _dtp_local(field_elem.tag) != "fields":
+            continue
+        has_selection = any(
+            _dtp_local(c.tag) == "selection" for c in field_elem
+        )
+        if not has_selection:
+            continue
+        filters.append(_parse_dtp_filter_field(field_elem))
+    return filters
+
+
+def _dtp_endpoint_summary(elem) -> dict:
+    """Compact {name, type, description} for a DTP <source>/<target>."""
+    if elem is None:
+        return {}
+    attrs = {_dtp_local(k): v for k, v in elem.attrib.items()}
+    return {
+        "name": (attrs.get("name") or "").strip(),
+        "type": attrs.get("tlogo", "") or attrs.get("type", ""),
+        "description": attrs.get("description", ""),
+    }
+
+
+@mcp.tool
+def get_dtp_details(
+    dtp_id: str, section: str = "all", name_filter: str = ""
+) -> dict:
+    """
+    Get details for a Data Transfer Process (DTP): its source/target,
+    extraction and processing settings, and (most usefully) its filter
+    restrictions.
+
+    Reads the DTP model (dtpa) from the BW Modeling API. A DTP moves data from
+    a source InfoProvider/DataSource to a target via a transformation, and can
+    carry a filter that restricts which records are transferred. This tool
+    exposes those filters, which no other tool currently returns.
+
+    Args:
+        dtp_id: DTP technical name (e.g. "DTP_5KC6P8RN2WFAV1XITY14CNAF7").
+        section: Which part(s) to return. One of:
+            "all" (default) - info + settings + filters;
+            "info" - just source/target and description;
+            "settings" - extraction/processing/error-handling settings;
+            "filters" - just the filter restrictions.
+            Sections not requested are omitted (their count fields too).
+        name_filter: Case-insensitive substring. When set, the filters list is
+            limited to fields whose name or description matches (e.g.
+            "PLAN_ID"). Lets you fetch one field's restriction instead of all.
+            ``filterCount`` reflects the match; ``filterTotal`` reports how many
+            filtered fields exist.
+
+    Returns:
+        Dictionary with the DTP name and the requested section(s):
+          - source / target: {name, type, description}
+          - description: the DTP description
+          - settings: extractionMode (+ label), allowedExtractionModes,
+            packageSize, parallelExtraction, processingMode (+ label),
+            errorHandling (requestHandling, numberOfErrorsPerPackage)
+          - filters: one entry per filtered field, each with field, dtaName,
+            description, and selections (each: sign I/E, operator, low, high?)
+          - filterCount / filterTotal (when filters are included)
+    """
+    section_norm = (section or "all").strip().lower()
+    valid_sections = {"all", "info", "settings", "filters"}
+    if section_norm not in valid_sections:
+        return {
+            "error": (
+                f"Invalid section '{section}'. Valid: all, info, settings, "
+                "filters."
+            ),
+            "dtp": dtp_id,
+        }
+    want_info = section_norm in ("all", "info")
+    want_settings = section_norm in ("all", "settings")
+    want_filters = section_norm in ("all", "filters")
+
+    conn = BWConnection.from_env()
+    try:
+        response = _bw_request(
+            conn,
+            f"/sap/bw/modeling/dtpa/{dtp_id}",
+            accept="application/vnd.sap.bw.modeling.dtpa-v1_0_0+xml",
+        )
+    except requests.exceptions.HTTPError as e:
+        return {
+            "error": f"HTTP {e.response.status_code}: {e.response.reason}",
+            "dtp": dtp_id,
+        }
+
+    root = ET.fromstring(response.text)
+    result: dict = {"dtp": root.get("name", dtp_id)}
+
+    if want_info:
+        result["description"] = root.get("description", "")
+        source = next((c for c in root.iter() if _dtp_local(c.tag) == "source"), None)
+        target = next((c for c in root.iter() if _dtp_local(c.tag) == "target"), None)
+        result["source"] = _dtp_endpoint_summary(source)
+        result["target"] = _dtp_endpoint_summary(target)
+
+    if want_settings:
+        settings: dict = {}
+        ext = next(
+            (c for c in root.iter() if _dtp_local(c.tag) == "extractionSettings"),
+            None,
+        )
+        if ext is not None:
+            mode = ext.get("extractionMode", "")
+            settings["extractionMode"] = mode
+            if mode in _DTP_EXTRACTION_MODES:
+                settings["extractionModeLabel"] = _DTP_EXTRACTION_MODES[mode]
+            for attr in ("allowedExtractionModes", "packageSize", "parallelExtraction"):
+                if ext.get(attr) is not None:
+                    settings[attr] = ext.get(attr)
+        exe = next(
+            (c for c in root.iter() if _dtp_local(c.tag) == "execution"), None
+        )
+        if exe is not None:
+            pmode = exe.get("processingMode", "")
+            settings["processingMode"] = pmode
+            if pmode in _DTP_PROCESSING_MODES:
+                settings["processingModeLabel"] = _DTP_PROCESSING_MODES[pmode]
+        err = next(
+            (c for c in root.iter() if _dtp_local(c.tag) == "errorHandling"), None
+        )
+        if err is not None:
+            settings["errorHandling"] = {
+                "requestHandling": err.get("requestHandling", ""),
+                "numberOfErrorsPerPackage": err.get("numberOfErrorsPerPackage", ""),
+            }
+        result["settings"] = settings
+
+    if want_filters:
+        all_filters = _parse_dtp_filters(root)
+        needle = name_filter.strip().lower()
+        if needle:
+            filters = [
+                f
+                for f in all_filters
+                if needle in f.get("field", "").lower()
+                or needle in f.get("description", "").lower()
+            ]
+            result["filterTotal"] = len(all_filters)
+        else:
+            filters = all_filters
+        result["filterCount"] = len(filters)
+        result["filters"] = filters
 
     return result
 
