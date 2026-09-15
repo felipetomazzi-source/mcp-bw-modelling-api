@@ -19,3 +19,4 @@ mcp-bw-modelling-api/
 # OS / editor cruft
 .DS_Store
 Thumbs.db
+.mcp.json

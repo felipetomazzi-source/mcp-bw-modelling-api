@@ -5,6 +5,7 @@ Exposes SAP BW4/HANA modeling resources (InfoAreas, InfoObjects, ADSOs,
 CompositeProviders, Queries, etc.) as MCP tools via FastMCP.
 """
 
+import copy
 import json
 import os
 import re
@@ -2489,7 +2490,12 @@ def read_query_data(query_name: str) -> dict:
         saved. Ad-hoc navigation (changing drilldown, passing variable values,
         filtering) is not supported by this tool.
       - If the query requires mandatory variable input, the default execution
-        may return little or no data.
+        may return little or no data (hasResultSet: false, inputRequired:
+        true). If that happens, or if you need a characteristic added to the
+        drilldown that the query doesn't show by default, use
+        read_query_data_drilldown instead - it submits variables (at their
+        default values) and can add extra row characteristics, at the cost of
+        being a slower, less battle-tested mechanism.
       - The cell list is sparse: only populated cells are returned, addressed
         by 1-based row/col indexes into the row/column tuple lists.
 
@@ -2527,6 +2533,525 @@ def read_query_data(query_name: str) -> dict:
         }
 
     return _parse_bics_response(response.text)
+
+
+# ---------------------------------------------------------------------------
+# InA (Information Access) protocol - ad-hoc query drilldown
+#
+# InA is the undocumented, stateful HTTP protocol behind BW/4HANA's own
+# "Data Preview" Fiori app (/sap/bw/ina/GetResponse), reverse-engineered from
+# that app's client-side source (sap.bw4.lib, served by the BSP app
+# bw4_lib). Unlike the BICS endpoint above, it requires a persistent session
+# (cookies + CSRF token) across a 3-call handshake: fetch metadata, submit
+# variables, then request a result grid with a chosen row/column layout.
+# ---------------------------------------------------------------------------
+
+_INA_CLIENT_INFO = {"Version": "2019.02", "Identifier": "BW4QueryPreview", "Component": "BW4"}
+
+
+def _ina_session(conn: BWConnection) -> tuple[requests.Session, str, list]:
+    """Open an InA session and return (session, csrf_token, Analytics capabilities)."""
+    session = requests.Session()
+    session.auth = (conn.username, conn.password)
+    session.params = {"sap-client": conn.client}
+    session.verify = conn.verify_ssl
+
+    response = session.get(
+        f"{conn.base_url}/sap/bw/ina/GetServerInfo",
+        headers={"X-CSRF-Token": "fetch"},
+        timeout=30,
+    )
+    response.raise_for_status()
+    token = response.headers.get("x-csrf-token", "")
+    server_info = response.json()
+    capabilities = next(
+        (
+            s["Capabilities"]
+            for s in server_info.get("Services", [])
+            if s.get("Service") == "Analytics"
+        ),
+        [],
+    )
+    return session, token, capabilities
+
+
+def _ina_post(
+    session: requests.Session, conn: BWConnection, token: str, body: dict
+) -> dict:
+    """POST one InA request body to GetResponse and return the parsed JSON."""
+    response = session.post(
+        f"{conn.base_url}/sap/bw/ina/GetResponse",
+        json=body,
+        headers={"X-CSRF-Token": token, "Content-Type": "application/json"},
+        timeout=90,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def _ina_field_name(var: dict, dim: dict) -> str:
+    """Pick the SetOperand.FieldName for a variable's selection.
+
+    Mirrors sap.bw4.lib.olap.Variable#serializeForSubmit: hierarchy
+    variables key off the hierarchy attribute, date variables off the plain
+    key, everything else prefers a DISPLAY_KEY(_NC) attribute if the
+    dimension has one.
+    """
+    semantic_type = var.get("SemanticType")
+    if semantic_type == "HierarchyNodeVariable":
+        return dim["AttributeHierarchy"]["HierarchyKeyAttribute"]
+    if semantic_type == "HierarchyNameVariable":
+        return dim["KeyAttribute"]
+    if dim.get("DimensionType") == 7:  # Date
+        return dim["KeyAttribute"]
+    names = dim["AttributeHierarchy"]["AttributeNames"]
+    display_key_nc = dim["Name"] + ".DISPLAY_KEY_NC"
+    display_key = dim["Name"] + ".DISPLAY_KEY"
+    if display_key_nc in names:
+        return display_key_nc
+    if display_key in names:
+        return display_key
+    return dim["KeyAttribute"]
+
+
+def _ina_serialize_variable(var: dict, dims_by_name: dict) -> dict:
+    """Build one Variables[] entry, reusing the variable's current (default
+    or already-submitted) value rather than letting the caller override it.
+    """
+    dim = dims_by_name[var["DimensionReference"]["Name"]]
+    values = copy.deepcopy(
+        var.get("Values", {"Selection": {"SetOperand": {"Elements": []}}})
+    )
+    values["Selection"]["SetOperand"]["FieldName"] = _ina_field_name(var, dim)
+    for element in values["Selection"]["SetOperand"].get("Elements", []):
+        element.pop("operation", None)
+        if element.get("Comparison") == "=":
+            element.pop("Comparison", None)
+    return {"Name": var["Name"], "Values": values}
+
+
+def _ina_fetch_metadata(
+    session: requests.Session,
+    conn: BWConnection,
+    token: str,
+    capabilities: list,
+    query_name: str,
+) -> dict:
+    """Step 1: fetch the full query Cube (dimensions, variables, filters)."""
+    body = {
+        "ClientInfo": _INA_CLIENT_INFO,
+        "Metadata": {
+            "Capabilities": capabilities,
+            "Context": "Analytics",
+            "DataSource": {"ObjectName": query_name, "Type": "Query"},
+            "Expand": [
+                "Axis?Name=Rows",
+                "Axis?Name=Columns",
+                "Axis?Name=Filter",
+                "Axis?Name=Repository",
+                "Variables",
+                "VariableVariants",
+                "QueryDataCells",
+                "DynamicFilter",
+                "Conditions",
+                "Exceptions",
+                "UniversalDisplayHierarchies",
+            ],
+            "Language": "EN",
+        },
+        "Options": ["StatefulServer"],
+    }
+    return _ina_post(session, conn, token, body)["Cube"]
+
+
+def _ina_submit_variables(
+    session: requests.Session,
+    conn: BWConnection,
+    token: str,
+    capabilities: list,
+    cube: dict,
+) -> dict:
+    """Step 2: confirm all variables at their current values (the server
+    otherwise refuses a result request with "Variables exist - enter values
+    and submit"). Returns the updated Cube.
+    """
+    dims_by_name = {d["Name"]: d for d in cube["Dimensions"]}
+    definition_dims = [
+        {
+            "Attributes": [
+                {"Name": a["Name"], "Obtainability": "Always"}
+                for a in d.get("Attributes", [])
+            ],
+            "Axis": d.get("AxisDefault"),
+            "Name": d["Name"],
+            "NonEmpty": False,
+            "ReadMode": d.get("ResultMode"),
+            "ResultSetReadMode": d.get("ResultSetReadMode"),
+            "ResultStructure": [
+                {"Result": "Members", "Visibility": "Visible"},
+                {"Result": "Total", "Visibility": "Visible"},
+            ],
+        }
+        for d in cube["Dimensions"]
+    ]
+    body = {
+        "Analytics": {
+            "Capabilities": capabilities,
+            "DataSource": {
+                "InstanceId": cube["DataSource"]["InstanceId"],
+                "ObjectName": cube["DataSource"]["ObjectName"],
+                "Type": "Query",
+            },
+            "Definition": {
+                "Dimensions": definition_dims,
+                "Query": {
+                    "Axes": [
+                        {"Axis": "Columns", "ResultAlignment": "Bottom", "Type": 2, "ZeroSuppressionType": 0},
+                        {"Axis": "Rows", "ResultAlignment": "Bottom", "Type": 1, "ZeroSuppressionType": 0},
+                    ]
+                },
+                "QueryDataCells": cube.get("QueryDataCells", {}),
+                "ResultSetFeatureRequest": {
+                    "ResultEncoding": "None",
+                    "ResultFormat": "Version2",
+                    "SubSetDescription": {"ColumnFrom": 0, "ColumnTo": -1, "RowFrom": 0, "RowTo": -1},
+                    "UseDefaultAttributeKey": False,
+                },
+                "Sort": [],
+                "Variables": [_ina_serialize_variable(v, dims_by_name) for v in cube["Variables"]],
+            },
+            "ProcessingDirectives": {"ProcessingStep": "VariableSubmit"},
+        },
+        "Language": "EN",
+        "Options": ["StatefulServer"],
+    }
+    result = _ina_post(session, conn, token, body)
+    errors = [m.get("Text", "") for m in result.get("Messages", []) if m.get("Type") == 2]
+    if errors:
+        raise RuntimeError("; ".join(errors))
+    return result["Cube"]
+
+
+def _ina_transform_structure_member(member: dict, dim_name: str) -> dict:
+    """Convert a raw metadata structure member (keyed by compound field
+    names) into the {Name, Description, Visibility} shape InA expects back.
+    """
+    return {
+        "Name": member[f"{dim_name}.KEY"],
+        "Description": member.get(f"{dim_name}.LONG_TEXT", ""),
+        "Visibility": member.get("Visibility", "Visible"),
+    }
+
+
+def _ina_result_dimension(dim: dict) -> dict:
+    """Build one Dimensions[] entry for a Rows/Columns dimension.
+
+    Mirrors sap.bw4.lib.olap.Characteristic#serialize4ResultRequest.
+    """
+    entry = {
+        "Attributes": (
+            [
+                {"Name": a["Name"], "Obtainability": "Always"}
+                for a in dim.get("DefaultResultSetAttributes", [])
+            ]
+            or [{"Name": dim["KeyAttribute"], "Obtainability": "Always"}]
+        ),
+        "Axis": dim["AxisDefault"],
+        "Description": dim.get("Description"),
+        "KeyAttribute": dim.get("KeyAttribute"),
+        "Name": dim["Name"],
+        "NonEmtpy": False,
+        "ReadMode": dim.get("VariableReadMode"),
+        "ResultSetReadMode": dim.get("ResultSetReadMode"),
+        "ResultStructure": dim.get("DefaultResultStructure")
+        or [
+            {"Result": "Members", "Visibility": "Visible"},
+            {"Result": "Total", "Visibility": "Visible"},
+        ],
+    }
+    if dim.get("Members"):
+        entry["Members"] = [
+            _ina_transform_structure_member(m, dim["Name"])
+            for m in dim["Members"]
+            if m.get("Visibility", "Visible") == "Visible"
+        ]
+    return entry
+
+
+def _ina_fetch_result(
+    session: requests.Session,
+    conn: BWConnection,
+    token: str,
+    capabilities: list,
+    cube: dict,
+    extra_row_dims: list[str],
+    row_limit: int,
+    column_limit: int,
+) -> dict:
+    """Step 3: request the result grid, with extra_row_dims added to the row
+    axis ahead of the query's own Rows/Columns dimensions.
+    """
+    dims_by_name = {d["Name"]: d for d in cube["Dimensions"]}
+    rowcol_dims = [d for d in cube["Dimensions"] if d.get("AxisDefault") in ("Rows", "Columns")]
+
+    extra_dims = []
+    for name in extra_row_dims:
+        if name not in dims_by_name:
+            raise ValueError(f"'{name}' is not a characteristic of this query")
+        extra = copy.deepcopy(dims_by_name[name])
+        extra["AxisDefault"] = "Rows"
+        extra_dims.append(extra)
+
+    # The query's own design-time filters (FixedFilter, e.g. 0FISCVARNT=V5,
+    # and DynamicFilter, e.g. which restricted key figures are active) are
+    # NOT applied automatically by this step - they must be echoed back here
+    # or the server aggregates over the unrestricted data/every key figure,
+    # which is dramatically more expensive and can time the request out.
+    design_time_subselections = []
+    for filter_key in ("FixedFilter", "DynamicFilter"):
+        design_filter = cube.get(filter_key) or {}
+        design_time_subselections.extend(
+            design_filter.get("Selection", {}).get("Operator", {}).get("SubSelections", [])
+        )
+
+    body = {
+        "ClientInfo": _INA_CLIENT_INFO,
+        "Analytics": {
+            "Capabilities": capabilities,
+            "DataSource": {
+                "InstanceId": cube["DataSource"]["InstanceId"],
+                "ObjectName": cube["DataSource"]["ObjectName"],
+                "Type": "Query",
+            },
+            "Definition": {
+                "Filter": {"Selection": {"Operator": {"Code": "And", "SubSelections": design_time_subselections}}},
+                "Conditions": [],
+                "Exceptions": [],
+                "Sort": [],
+                "Dimensions": [_ina_result_dimension(d) for d in extra_dims + rowcol_dims],
+                "Variables": [_ina_serialize_variable(v, dims_by_name) for v in cube["Variables"]],
+                "Name": cube["DataSource"]["ObjectName"],
+                "InputEnabled": True,
+                "Query": {"Axes": cube["Query"]["Axes"]},
+                "CurrencyTranslation": {"targetCurrency": "", "translation": "", "text": ""},
+                "QueryDataCells": cube.get("QueryDataCells", {}),
+                "ResultSetFeatureRequest": {
+                    "ResultEncoding": "None",
+                    "ResultFormat": "Version2",
+                    "SubSetDescription": {
+                        "ColumnFrom": 0,
+                        "ColumnTo": column_limit,
+                        "RowFrom": 0,
+                        "RowTo": row_limit,
+                    },
+                    "UseDefaultAttributeKey": False,
+                },
+                "UniversalDisplayHierarchies": cube.get("UniversalDisplayHierarchies"),
+            },
+        },
+        "Options": ["StatefulServer"],
+    }
+    return _ina_post(session, conn, token, body)
+
+
+def _ina_dimension_members(dim: dict) -> list[dict]:
+    """Expand one axis dimension's columnar Attributes[].Values into a list
+    of {key, internalKey, text} members, one per member index.
+
+    InA encodes members column-wise: each Attribute (".KEY", ".DISPLAY_KEY",
+    ".MEDIUM_TEXT", ...) carries its own parallel Values array; a member's
+    row is the same index across all of a dimension's attributes.
+    """
+    attrs = {a["Name"].rsplit(".", 1)[-1]: a.get("Values", []) for a in dim.get("Attributes", [])}
+    count = dim.get("MemberTypes", {}).get("Size") or len(next(iter(attrs.values()), []))
+    members = []
+    for i in range(count):
+        internal_key = attrs["KEY"][i] if "KEY" in attrs and i < len(attrs["KEY"]) else None
+        key = None
+        for pref in ("DISPLAY_KEY", "KEY"):
+            if pref in attrs and i < len(attrs[pref]):
+                key = attrs[pref][i]
+                break
+        text = None
+        for pref in ("MEDIUM_TEXT", "LONG_TEXT", "SHORT_TEXT"):
+            if pref in attrs and i < len(attrs[pref]):
+                text = attrs[pref][i]
+                break
+        members.append({"key": key, "internalKey": internal_key, "text": text or ""})
+    return members
+
+
+def _ina_parse_axis(axis: dict) -> dict:
+    """Parse one Grids[0].Axes[] entry into {headers, tuples}, matching the
+    shape read_query_data returns for columns/rows.
+    """
+    dims = axis.get("Dimensions", [])
+    headers = [
+        {
+            "name": d["Name"],
+            "text": d.get("Description", ""),
+            "isStructure": d.get("DimensionType") == 2,
+        }
+        for d in dims
+    ]
+    dim_members = [_ina_dimension_members(d) for d in dims]
+    tuple_count = axis.get("TupleCount", 0)
+    per_dim_indexes = [t.get("MemberIndexes", {}).get("Values", []) for t in axis.get("Tuples", [])]
+
+    tuples = []
+    for t in range(tuple_count):
+        entry = []
+        for d, indexes in zip(dim_members, per_dim_indexes):
+            idx = indexes[t] if t < len(indexes) else -1
+            entry.append(d[idx] if 0 <= idx < len(d) else {"key": "", "internalKey": "", "text": ""})
+        tuples.append(entry)
+
+    return {"headers": headers, "tuples": tuples}
+
+
+def _ina_parse_cells(grid: dict) -> list[dict]:
+    """Flatten Grids[0].Cells into the {row, col, value, formatted} shape
+    read_query_data uses (1-based, row-major: columns vary fastest).
+    """
+    columns_axis = next((a for a in grid.get("Axes", []) if a.get("Type") == "Columns"), {})
+    col_count = columns_axis.get("TupleCount", 0) or 1
+    cells_data = grid.get("Cells", {})
+    values = cells_data.get("Values", {}).get("Values", [])
+    formatted = cells_data.get("ValuesFormatted", {}).get("Values", [])
+
+    cells = []
+    for i, value in enumerate(values):
+        cells.append(
+            {
+                "row": i // col_count + 1,
+                "col": i % col_count + 1,
+                "value": value,
+                "formatted": formatted[i] if i < len(formatted) else "",
+            }
+        )
+    return cells
+
+
+def _ina_parse_grid(grid: dict) -> dict:
+    """Parse one Grids[0] entry into the same columns/rows/cells shape
+    read_query_data returns, for consistency between the two tools.
+    """
+    axes = {a.get("Type"): a for a in grid.get("Axes", [])}
+    columns = _ina_parse_axis(axes.get("Columns", {}))
+    rows = _ina_parse_axis(axes.get("Rows", {}))
+    return {
+        "description": grid.get("DataSource", {}).get("Description", ""),
+        "columns": columns,
+        "rows": rows,
+        "rowTupleCount": axes.get("Rows", {}).get("TupleCount", 0),
+        "columnTupleCount": axes.get("Columns", {}).get("TupleCount", 0),
+        "cells": _ina_parse_cells(grid),
+        "cellCount": len(grid.get("Cells", {}).get("Values", {}).get("Values", [])),
+    }
+
+
+@mcp.tool
+def read_query_data_drilldown(
+    query_name: str,
+    drilldown: list[str],
+    row_limit: int = 200,
+    column_limit: int = 50,
+) -> dict:
+    """
+    Execute a BW Query with an AD-HOC DRILLDOWN not present in its saved
+    default view (e.g. add "Customer: CPV Band" to a Sales History query
+    that doesn't have it on rows/columns by default).
+
+    read_query_data always returns the query's saved default view - it has
+    no way to add a characteristic that the query designer left on the
+    "free" axis (available, but not currently drilled into). This tool
+    fills that gap: it adds the given characteristic(s) to the row axis,
+    in addition to the query's existing row/column characteristics, then
+    executes the query and returns the resulting grid.
+
+    HOW THIS WORKS: BW/4HANA's own "Data Preview" Fiori app talks to an
+    internal, undocumented HTTP API called InA (Information Access) at
+    /sap/bw/ina/GetResponse. This tool replicates that protocol in three
+    calls: fetch the query's full metadata, submit its variables (at their
+    CURRENT/DEFAULT values only - this tool does not accept variable value
+    overrides), then request a result grid with the extra drilldown applied.
+    Validated end to end, including a two-level nested row drilldown.
+
+    LIMITATIONS:
+      - Mandatory variables are submitted with their default values, same
+        as read_query_data - there is no way to pass a different value.
+      - This is an undocumented, reverse-engineered protocol (no SAP
+        documentation backs it, unlike the BW Modeling API read_query_data
+        uses), so treat it as less battle-tested. The result-fetch step
+        must echo back the query's own design-time filters (FixedFilter /
+        DynamicFilter - e.g. which restricted/calculated key figures are
+        active) or the server ends up aggregating far more than the query
+        actually needs, which can time the request out even for a tiny
+        row_limit; this tool already does that automatically, but a query
+        with filter constructs not covered by that logic could still hit
+        this.
+      - You can only add a characteristic that is already part of the
+        query's design (any axis, including "free"); check
+        get_query_structure for what's available. You cannot introduce an
+        InfoObject the query doesn't reference at all.
+
+    Args:
+        query_name: Query technical name.
+        drilldown: Characteristic technical name(s) to add to the row axis,
+            nested in the given order (e.g. ["0SOLD_TO__0CUST_CLASS"]).
+        row_limit: Max rows to request (default 200).
+        column_limit: Max columns to request (default 50).
+
+    Returns:
+        Same shape as read_query_data (description, columns/rows with
+        headers+tuples, rowTupleCount/columnTupleCount, cells as
+        {row, col, value, formatted}, cellCount), plus "drilldown" and
+        "messages". On failure: {"error", "query", ...}.
+    """
+    conn = BWConnection.from_env()
+
+    try:
+        session, token, capabilities = _ina_session(conn)
+        cube = _ina_fetch_metadata(session, conn, token, capabilities, query_name)
+        cube = _ina_submit_variables(session, conn, token, capabilities, cube)
+        result = _ina_fetch_result(
+            session, conn, token, capabilities, cube, drilldown, row_limit, column_limit
+        )
+    except requests.exceptions.Timeout:
+        return {
+            "error": "Request timed out while fetching the result grid.",
+            "query": query_name,
+            "note": (
+                "This can happen on large/wide InfoProviders - the InA "
+                "result-fetch step appears to be data/complexity dependent, "
+                "not necessarily caused by the drilldown itself. Try a "
+                "smaller row_limit/column_limit or a lighter query."
+            ),
+        }
+    except requests.exceptions.HTTPError as e:
+        return {
+            "error": f"HTTP {e.response.status_code}: {e.response.reason}",
+            "detail": e.response.text[:500],
+            "query": query_name,
+        }
+    except (ValueError, RuntimeError, KeyError) as e:
+        return {"error": str(e), "query": query_name}
+
+    messages = [m.get("Text", "") for m in result.get("Messages", []) if m.get("Text")]
+    if any(m.get("Type") == 2 for m in result.get("Messages", [])):
+        return {"error": "; ".join(messages), "query": query_name, "raw": result}
+
+    grids = result.get("Grids") or []
+    if not grids:
+        return {"error": "No result grid returned.", "query": query_name, "raw": result}
+
+    parsed = _ina_parse_grid(grids[0])
+    return {
+        "query": query_name,
+        "drilldown": drilldown,
+        "messages": messages,
+        **parsed,
+    }
 
 
 # ---------------------------------------------------------------------------
