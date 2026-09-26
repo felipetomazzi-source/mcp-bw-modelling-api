@@ -126,7 +126,7 @@ dependencies:
 | `get_infoobject_details` | Get InfoObject properties, incl. navigational vs display attributes and compounding |
 | `get_characteristic_values` | Read the actual master-data values of a characteristic (e.g. list 0CUSTOMER/0MATERIAL values), optionally restricted to an InfoProvider |
 | `get_adso_fields` | Get field list of an ADSO |
-| `get_composite_provider_parts` | Get the source (part) providers of a CompositeProvider |
+| `get_composite_provider_parts` | Get the source (part) providers and join conditions of a CompositeProvider; optionally the node tree (joins, projection filters, calculated fields), per-provider field assignments (source field -> CompositeProvider field) and output-field lineage |
 | `get_infoarea_contents` | List objects in an InfoArea (flat search) |
 | `get_infoarea_tree` | List objects under an InfoArea via the InfoProvider structure (recursive, reliable) |
 | `get_transformation_details` | Get transformation metadata (source, target, rules) |
@@ -134,8 +134,10 @@ dependencies:
 | `get_query_structure` | List a query's characteristics, key figures, and measures (restricted + calculated) |
 | `get_query_filters` | Read a query's filters (fixed/default) and restricted key figures |
 | `read_query_data` | Execute a query and return its result data (default view only) - see [Reading Query Result Data](#reading-query-result-data) |
-| `read_query_data_drilldown` | Execute a query with an ad-hoc drilldown and/or a mandatory-variable screen submitted automatically - see [Reading Query Result Data](#reading-query-result-data) |
+| `read_query_data_drilldown` | Execute a query with an ad-hoc drilldown, an ad-hoc filter, and/or a mandatory-variable screen submitted automatically - see [Reading Query Result Data](#reading-query-result-data) |
 | `get_data_flow` | Show lineage: inbound/outbound transformations and DTPs (with source/target, status, and process chains) |
+| `search_abap_objects` | Search the ABAP repository (via ADT) for programs, classes, interfaces, function modules, CDS views, tables, packages by name (read-only) |
+| `get_abap_source` | Read the ABAP source of a program, include, class (optionally one method, or its local includes), interface, function module, CDS view or table (read-only; e.g. a transformation's generated AMDP class) |
 
 ## Reading Query Result Data
 
@@ -151,13 +153,26 @@ you hit one of its limitations:
   it cannot submit one.
 - **`read_query_data_drilldown`** exists to cover that gap and to add an
   ad-hoc characteristic to the drilldown that the query's default view
-  doesn't show. It does so via **InA (Information Access)**, the internal
-  HTTP API behind BW/4HANA's own "Data Preview" Fiori app
-  (`/sap/bw/ina/GetResponse`) - reverse-engineered from that app's
-  client-side source, since SAP does not publicly document it. It performs
-  a 3-call handshake (fetch metadata, submit variables at their default
-  value, request the result grid) and echoes back the query's design-time
-  filters so the server doesn't aggregate more than the query needs.
+  doesn't show, restrict the result to specific characteristic values
+  before execution (e.g. one customer, or a short list of fiscal periods)
+  via its `filters` parameter, and/or override one of the query's own
+  variables via `variable_values` (e.g. submit a specific date instead of
+  a "current date" SAP-exit default). It does so via **InA (Information
+  Access)**, the internal HTTP API behind BW/4HANA's own "Data Preview"
+  Fiori app (`/sap/bw/ina/GetResponse`) - reverse-engineered from that
+  app's client-side source, since SAP does not publicly document it. It
+  performs a 3-call handshake (fetch metadata, submit variables at their
+  default value or the given `variable_values` override, request the
+  result grid) and echoes back the query's design-time filters, plus any
+  ad-hoc `filters`, so the server doesn't aggregate more than the caller
+  actually needs. Both `filters` and `variable_values` are equality/
+  IN-list only (no ranges or exclusions); `filters` can only target a
+  characteristic already part of the query's design, same as the
+  drilldown. Note that a characteristic can be restricted by both a query
+  variable and an ad-hoc filter at once (they combine with AND) - if a
+  variable's default is narrower than the filter you want, use
+  `variable_values` to change the variable itself instead of `filters`
+  (see `get_query_filters` for which characteristics are variable-driven).
 
 Because it rides on an undocumented, unversioned protocol rather than the
 BW Modeling API, `read_query_data_drilldown` is inherently less

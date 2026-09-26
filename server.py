@@ -275,7 +275,14 @@ mcp = FastMCP(
         "                       restricted to an InfoProvider) use\n"
         "                       get_characteristic_values.\n"
         "     - ADSO         -> get_adso_fields (field/InfoObject list)\n"
-        "     - HCPR         -> get_composite_provider_parts (source providers)\n"
+        "     - HCPR         -> get_composite_provider_parts (source providers,\n"
+        "                       joins; include_nodes / include_mappings /\n"
+        "                       include_lineage for node graph, field\n"
+        "                       assignments and field lineage)\n"
+        "     - ABAP code    -> search_abap_objects / get_abap_source\n"
+        "                       (programs, classes + methods, FMs, CDS;\n"
+        "                       e.g. a HANA transformation's AMDP class\n"
+        "                       classNameA, method GLOBAL_END)\n"
         "     - Query        -> get_query_structure (characteristics, key\n"
         "                       figures, measures) AND get_query_filters\n"
         "                       (fixed/default filters, restricted key figures).\n"
@@ -794,32 +801,453 @@ def _parse_hcpr_join_conditions(root, alias_to_name: dict) -> list[dict]:
     return conditions
 
 
+# ---------------------------------------------------------------------------
+# CompositeProvider model analysis (node graph, field mappings, lineage)
+# ---------------------------------------------------------------------------
+
+
+def _hcpr_collapse(text: str) -> str:
+    """Collapse whitespace/newlines of a SQL formula into a single line."""
+    return " ".join((text or "").split())
+
+
+def _hcpr_elem_label(elem) -> str:
+    """Return the best available description of a view-node <element>."""
+    for c in elem:
+        if _hcpr_local(c.tag) == "endUserTexts" and c.get("label"):
+            return c.get("label")
+    for c in elem:
+        if _hcpr_local(c.tag) == "localProperties":
+            for d in c:
+                if _hcpr_local(d.tag) == "descriptions" and d.get("label"):
+                    return d.get("label")
+    return ""
+
+
+def _hcpr_elem_formula(elem) -> str:
+    for c in elem:
+        if _hcpr_local(c.tag) == "formulaExpression":
+            for f in c:
+                if _hcpr_local(f.tag) == "formula":
+                    return _hcpr_collapse(f.text)
+    return ""
+
+
+def _hcpr_clean_source(source: str, provider: str) -> str:
+    """Strip the generated prefix from a part-provider field name.
+
+    Open ODS View fields appear as ``2F<provider>-<FIELD>`` (and the view's key
+    characteristic as bare ``2F<provider>``); field-based ADSO fields as
+    ``4<provider>-<FIELD>``. InfoObject-based fields have no prefix.
+    """
+    if not source or not provider:
+        return source
+    m = re.match(rf"^\d[A-Z]?{re.escape(provider)}(-(.*))?$", source)
+    if not m:
+        return source
+    return m.group(2) if m.group(2) else f"{provider} (key)"
+
+
+def _hcpr_provider_type(alias: str) -> str:
+    """Derive the part-provider type from its alias (e.g. U1.ADSO.5 -> ADSO)."""
+    parts = (alias or "").split(".")
+    return parts[1] if len(parts) >= 3 else ""
+
+
+class _HcprModel:
+    """Parsed view-node graph of a CompositeProvider model."""
+
+    def __init__(self, root):
+        self.root = root
+        self.nodes: dict = {}
+        for vn in root:
+            if _hcpr_local(vn.tag) == "viewNode":
+                self.nodes[vn.get("name", "")] = vn
+        default_ref = root.get("defaultNode", "")
+        self.output_node = _hcpr_ref_target(default_ref) if default_ref else ""
+        if not self.output_node and self.nodes:
+            self.output_node = next(iter(self.nodes))
+
+        # Per node: parsed inputs, elements, filter, joins.
+        self.inputs: dict = {}
+        self.elements: dict = {}
+        self.filters: dict = {}
+        self.joins: dict = {}
+        # consumers[child_node] -> list of (parent_node, {source: [targets]})
+        self.consumers: dict = {}
+        for name, vn in self.nodes.items():
+            self.inputs[name] = [self._parse_input(i) for i in vn if _hcpr_local(i.tag) == "input"]
+            self.elements[name] = [self._parse_element(e) for e in vn if _hcpr_local(e.tag) == "element"]
+            for ch in vn:
+                t = _hcpr_local(ch.tag)
+                if t == "filterExpression":
+                    self.filters[name] = _hcpr_collapse(
+                        next((f.text for f in ch if _hcpr_local(f.tag) == "formula"), "")
+                    )
+                elif t == "join":
+                    lefts = [c.text for c in ch if _hcpr_local(c.tag) == "leftElementName" and c.text]
+                    rights = [c.text for c in ch if _hcpr_local(c.tag) == "rightElementName" and c.text]
+                    self.joins.setdefault(name, []).append(
+                        {
+                            "joinType": ch.get("joinType", ""),
+                            "cardinality": ch.get("cardinality", ""),
+                            "left": _hcpr_ref_target(ch.get("leftInput", "")),
+                            "right": _hcpr_ref_target(ch.get("rightInput", "")),
+                            "on": [{"left": l, "right": r} for l, r in zip(lefts, rights)],
+                        }
+                    )
+            for inp in self.inputs[name]:
+                if inp["kind"] == "node":
+                    fwd: dict = {}
+                    for m in inp["mappings"]:
+                        if m["source"]:
+                            fwd.setdefault(m["source"], []).append(m["target"])
+                    self.consumers.setdefault(inp["name"], []).append((name, fwd))
+
+    @staticmethod
+    def _parse_input(inp) -> dict:
+        nested = next((c.text for c in inp if _hcpr_local(c.tag) == "viewNode"), "")
+        entity = next((c.text for c in inp if _hcpr_local(c.tag) == "entity"), "")
+        name = inp.get("name", "")
+        alias = inp.get("alias", "")
+        is_node = bool(nested) and not entity
+        mappings = []
+        for m in inp:
+            if _hcpr_local(m.tag) != "mapping":
+                continue
+            mtype = _hcpr_xsi(m)
+            entry = {
+                "source": m.get("sourceName", ""),
+                "target": m.get("targetName", ""),
+            }
+            if mtype and mtype != "ElementMapping":
+                entry["mappingType"] = mtype
+            const = m.get("value") or m.get("constant") or m.get("constantValue")
+            if const is not None:
+                entry["constant"] = const
+            mappings.append(entry)
+        return {
+            "name": _hcpr_ref_target(nested) if is_node else name,
+            "alias": alias,
+            "kind": "node" if is_node else "provider",
+            "providerType": "" if is_node else _hcpr_provider_type(alias),
+            "mappings": mappings,
+        }
+
+    @staticmethod
+    def _parse_element(e) -> dict:
+        inline = next((c for c in e if _hcpr_local(c.tag) == "inlineType"), None)
+        dtype = ""
+        if inline is not None:
+            dtype = inline.get("name", "")
+            if inline.get("length"):
+                dtype += f"({inline.get('length')})"
+            elif inline.get("precision"):
+                dtype += f"({inline.get('precision')},{inline.get('scale', '0')})"
+        calculated = _hcpr_xsi(e) == "CalculatedBwElement"
+        el = {
+            "name": e.get("name", ""),
+            "infoObject": e.get("infoObjectName", ""),
+            "label": _hcpr_elem_label(e),
+            "dataType": dtype,
+        }
+        if calculated:
+            formula = _hcpr_elem_formula(e)
+            el["calculated"] = True
+            el["formula"] = formula
+            el["formulaFields"] = sorted(set(re.findall(r'"([^"]+)"', formula)))
+        return el
+
+    # -- lineage ----------------------------------------------------------
+
+    def trace_back(self, node: str, field: str, _seen=None) -> list:
+        """Return the origins of ``field`` as exposed by ``node``."""
+        _seen = _seen or set()
+        key = (node, field)
+        if key in _seen:
+            return []
+        _seen = _seen | {key}
+        origins = []
+        calc = next(
+            (e for e in self.elements.get(node, []) if e["name"] == field and e.get("calculated")),
+            None,
+        )
+        if calc:
+            origins.append(
+                {
+                    "calculatedIn": node,
+                    "formula": calc["formula"],
+                    "formulaFields": calc["formulaFields"],
+                    # Where each field read by the formula comes from.
+                    "formulaFieldOrigins": {
+                        f: self.compact_origins(node, f)
+                        for f in calc["formulaFields"]
+                        if f != field
+                    },
+                }
+            )
+        for inp in self.inputs.get(node, []):
+            for m in inp["mappings"]:
+                if m["target"] != field:
+                    continue
+                if "constant" in m and not m["source"]:
+                    origins.append({"node": node, "constant": m["constant"]})
+                    continue
+                if inp["kind"] == "provider":
+                    o = {
+                        "provider": inp["name"],
+                        "providerType": inp["providerType"],
+                        "alias": inp["alias"],
+                        "sourceField": m["source"],
+                        "enteredAt": node,
+                        "path": [f"{node}.{field}"],
+                    }
+                    clean = _hcpr_clean_source(m["source"], inp["name"])
+                    if clean != m["source"]:
+                        o["sourceFieldName"] = clean
+                    origins.append(o)
+                else:
+                    for sub in self.trace_back(inp["name"], m["source"], _seen):
+                        sub = dict(sub)
+                        if "path" in sub:
+                            sub["path"] = [f"{node}.{field}"] + sub["path"]
+                        origins.append(sub)
+        return origins
+
+    def trace_forward(self, node: str, field: str, _seen=None) -> list:
+        """Return the output-node field names that ``node.field`` reaches."""
+        if node == self.output_node:
+            return [field]
+        _seen = _seen or set()
+        if (node, field) in _seen:
+            return []
+        _seen = _seen | {(node, field)}
+        out = []
+        for parent, fwd in self.consumers.get(node, []):
+            for tgt in fwd.get(field, []):
+                out.extend(self.trace_forward(parent, tgt, _seen))
+        return sorted(set(out))
+
+    def formula_uses(self, node: str, field: str) -> list:
+        """Calculated fields (at ``node`` or any node above) whose formula
+        reads ``node.field`` as it propagates upward."""
+        uses = []
+        seen = set()
+        stack = [(node, field)]
+        while stack:
+            n, f = stack.pop()
+            if (n, f) in seen:
+                continue
+            seen.add((n, f))
+            for e in self.elements.get(n, []):
+                if e.get("calculated") and f in e.get("formulaFields", []):
+                    uses.append(
+                        {
+                            "node": n,
+                            "calculatedField": e["name"],
+                            "outputFields": self.trace_forward(n, e["name"]),
+                        }
+                    )
+            for parent, fwd in self.consumers.get(n, []):
+                for tgt in fwd.get(f, []):
+                    stack.append((parent, tgt))
+        return uses
+
+    def compact_origins(self, node: str, field: str) -> list:
+        """Origins of node.field as short strings, e.g. 'B020_O28.TEL_NUMBER'."""
+        out = []
+        for o in self.trace_back(node, field):
+            if "provider" in o:
+                out.append(f"{o['provider']}.{o.get('sourceFieldName', o['sourceField'])}")
+            elif "calculatedIn" in o:
+                out.append(f"calculated@{o['calculatedIn']}")
+            elif "constant" in o:
+                out.append(f"constant '{o['constant']}'")
+        return sorted(set(out))
+
+    # -- views ------------------------------------------------------------
+
+    def node_summaries(self) -> list:
+        result = []
+        for name in self.nodes:
+            elems = self.elements[name]
+            entry = {
+                "name": name,
+                "type": _hcpr_xsi(self.nodes[name]),
+                "isOutputNode": name == self.output_node,
+                "fieldCount": len(elems),
+                "inputs": [
+                    {
+                        k: v
+                        for k, v in {
+                            "name": i["name"],
+                            "kind": i["kind"],
+                            "providerType": i["providerType"],
+                            "alias": i["alias"],
+                            "mappedFieldCount": len(i["mappings"]),
+                        }.items()
+                        if v != ""
+                    }
+                    for i in self.inputs[name]
+                ],
+            }
+            if name in self.filters:
+                entry["filter"] = self.filters[name]
+            if name in self.joins:
+                entry["joins"] = self.joins[name]
+            calcs = [
+                {k: e[k] for k in ("name", "infoObject", "label", "formula", "formulaFields") if e.get(k)}
+                for e in elems
+                if e.get("calculated")
+            ]
+            if calcs:
+                entry["calculatedFields"] = calcs
+            iobjs = [e["name"] for e in elems if e["infoObject"]]
+            entry["infoObjectFieldCount"] = len(iobjs)
+            result.append(entry)
+        return result
+
+    def node_tree(self) -> str:
+        """Render the node graph (from the output node down) as indented text."""
+        lines: list = []
+
+        def render(name: str, prefix: str, connector: str, side: str, seen: set):
+            vn_type = _hcpr_xsi(self.nodes.get(name)) if name in self.nodes else ""
+            desc = f"{name} [{vn_type}]"
+            for j in self.joins.get(name, []):
+                on = ", ".join(
+                    p["left"] if p["left"] == p["right"] else f"{p['left']}={p['right']}"
+                    for p in j["on"]
+                )
+                desc += f" {j['joinType']} {j['cardinality']} ON {on}"
+            if name in self.filters:
+                desc += f"  FILTER {self.filters[name]}"
+            calcs = [e["name"] for e in self.elements.get(name, []) if e.get("calculated")]
+            if calcs:
+                desc += f"  CALC {', '.join(calcs)}"
+            lines.append(f"{prefix}{connector}{side}{desc}")
+            if name in seen:
+                return
+            seen = seen | {name}
+            if connector == "":
+                child_prefix = prefix
+            else:
+                child_prefix = prefix + ("   " if connector == "└─ " else "│  ")
+            join = (self.joins.get(name) or [{}])[0]
+            # Show the join's left input first, then the right one.
+            inputs = sorted(
+                self.inputs.get(name, []),
+                key=lambda i: 1 if join and (i["alias"] or i["name"]) == join.get("right") else 0,
+            )
+            for idx, inp in enumerate(inputs):
+                conn_ = "└─ " if idx == len(inputs) - 1 else "├─ "
+                s = ""
+                token = inp["alias"] or inp["name"]
+                if join:
+                    if token == join.get("left"):
+                        s = "(left) "
+                    elif token == join.get("right"):
+                        s = "(right) "
+                if inp["kind"] == "node":
+                    render(inp["name"], child_prefix, conn_, s, seen)
+                else:
+                    lines.append(
+                        f"{child_prefix}{conn_}{s}{inp['name']} "
+                        f"({inp['providerType'] or 'provider'}, alias {inp['alias']}, "
+                        f"{len(inp['mappings'])} fields)"
+                    )
+
+        if self.output_node:
+            render(self.output_node, "", "", "", set())
+        return "\n".join(lines)
+
+
 @mcp.tool
 def get_composite_provider_parts(
-    object_name: str, include_join_conditions: bool = True
+    object_name: str,
+    include_join_conditions: bool = True,
+    include_nodes: bool = False,
+    include_mappings: bool = False,
+    include_lineage: bool = False,
+    field_filter: str = "",
+    only_renamed: bool = False,
 ) -> dict:
     """
-    Get the part providers (data sources) of a CompositeProvider, and
-    (optionally) the join conditions between them.
+    Get the part providers (data sources) of a CompositeProvider, the join
+    conditions between them, and - on request - the full node graph, the
+    field mappings from each part provider, and field-level lineage.
 
     A CompositeProvider combines several source InfoProviders (ADSOs,
-    InfoObjects, Open ODS Views) via Union or Join nodes. This returns each
-    source (part) provider with the combination type of its parent node, plus
-    the ON-conditions of any Join nodes.
+    InfoObjects, Open ODS Views) via Union, Join and Projection nodes, which
+    can be nested (e.g. J6 <- J5 <- J3 <- ... <- P1 <- Open ODS View). Each
+    node input maps its source fields to the node's fields, and projections
+    can carry SQL filters and calculated fields.
+
+    WHAT TO REQUEST:
+      - "Which providers / joins?"            -> defaults.
+      - "How are the nodes built / filtered?"  -> include_nodes=True
+        (adds nodeTree text + per-node filters, joins, calculated fields).
+      - "Which source field goes to which CompositeProvider field?"
+                                               -> include_mappings=True
+        (per part provider: source field -> field at entry node -> output
+        field(s); fields not reaching the output are flagged).
+      - "Where does output field X come from?" -> include_lineage=True
+        (per output field: every origin provider field, calculated-field
+        formula or constant, with the node path; plus unassignedFields).
+      Narrow big models with field_filter (e.g. "CUSTOMER") and/or
+      only_renamed=True (mappings where the field name changes).
 
     Args:
         object_name: Technical name of the CompositeProvider (e.g. "B080_V05").
         include_join_conditions: If True (default), also return the join
             conditions under ``joinConditions``. Set to False to get only the
             part-provider list (e.g. for a pure Union provider with no joins).
+        include_nodes: If True, return ``nodeTree`` (an indented text rendering
+            of the node graph from the output node down, with join types, ON
+            fields, filters and calculated fields) and ``nodes`` (structured
+            per-node detail: type, inputs, filter, joins, calculated fields with
+            formulas, field counts).
+        include_mappings: If True, return ``mappings``: one entry per part
+            provider input with its field assignments. Each assignment has
+            sourceField (raw name in the model), sourceFieldName (cleaned name,
+            when the raw name has a generated prefix such as "2FB020_O14-"),
+            targetField (field at the node where the provider enters) and
+            outputFields (the CompositeProvider output field(s) it ends up in),
+            feedsCalculatedFields (calculated fields whose formula reads it,
+            e.g. ADR2 TEL_NUMBER -> MOBILEPH), and notInOutput (true when the
+            field reaches neither an output field nor a formula - typically a
+            join key or projection-filter-only field).
+        include_lineage: If True, return ``lineage``: for each field of the
+            output node, its InfoObject, label, data type, and ``origins`` -
+            each a provider field (provider, sourceField, enteredAt node, path),
+            a calculated field (calculatedIn, formula, formulaFields, and
+            formulaFieldOrigins mapping each formula field to its provider
+            fields) or a constant. Join-key fields list one origin per joined
+            side. The full lineage of a big join model can be ~50 KB - use
+            field_filter when you only need some fields. For a Union output
+            node each field also gets ``notFedBy`` (part providers that deliver
+            it empty). Also returns ``unassignedFields`` (output fields with no
+            origin at all - always empty in queries).
+        field_filter: Case-insensitive substring. Limits mappings to
+            assignments whose source/target/output field matches, and lineage to
+            output fields whose name, InfoObject or label (or any origin source
+            field) matches.
+        only_renamed: If True, mappings keep only assignments where the field
+            name changes on the way (cleaned source != target, or the output
+            field differs from the target) - the "interesting" assignments.
 
     Returns:
         Dictionary with:
           - object: the CompositeProvider name
-          - parts: list of part providers, each with name (source provider
-            technical name), alias (the CompositeProvider's internal alias),
-            and combination ("Union" / "JoinNode" / "Aggregation" - from the
-            parent view node).
+          - outputNode: the node exposed for reporting (e.g. "U1", "J6")
+          - providers: the distinct leaf part providers, each with name,
+            providerType (ADSO / FBPA (Open ODS View) / IOBJ ...), and the
+            aliases/nodes where it is used (one provider can be used several
+            times, e.g. in different projections).
+          - parts: list of all node inputs, each with name, alias, kind
+            ("provider" = a real part provider, "node" = a nested node feeding
+            this one) and combination (the type of the node it feeds:
+            "Union" / "JoinNode" / "Projection" / "Aggregation").
           - joinConditions (when include_join_conditions is on): one entry per
             join, each with:
               * node: the join node name (e.g. "J1")
@@ -832,6 +1260,8 @@ def get_composite_provider_parts(
                 result of a deeper join feeds into this one.
               * on: list of {left, right} field pairs (the ON condition)
           - joinConditionCount: number of join conditions (when included)
+          - nodeTree / nodes (include_nodes), mappings (include_mappings),
+            lineage / unassignedFields (include_lineage) - see Args.
     """
     conn = BWConnection.from_env()
 
@@ -865,16 +1295,133 @@ def get_composite_provider_parts(
             alias = child.get("alias", "")
             if alias:
                 alias_to_name[alias] = name
+            is_node = any(
+                _hcpr_local(c.tag) == "viewNode" for c in child
+            ) and not any(_hcpr_local(c.tag) == "entity" and c.text for c in child)
             parts.append(
-                {"name": name, "alias": alias, "combination": combination}
+                {
+                    "name": name,
+                    "alias": alias,
+                    "kind": "node" if is_node else "provider",
+                    "combination": combination,
+                }
             )
 
-    result: dict = {"object": object_name, "parts": parts}
+    model = _HcprModel(root)
+
+    providers: dict = {}
+    for node_name, inputs in model.inputs.items():
+        for inp in inputs:
+            if inp["kind"] != "provider":
+                continue
+            p = providers.setdefault(
+                inp["name"],
+                {"name": inp["name"], "providerType": inp["providerType"], "usedIn": []},
+            )
+            p["usedIn"].append({"node": node_name, "alias": inp["alias"]})
+
+    result: dict = {
+        "object": object_name,
+        "outputNode": model.output_node,
+        "providers": list(providers.values()),
+        "parts": parts,
+    }
 
     if include_join_conditions:
         join_conditions = _parse_hcpr_join_conditions(root, alias_to_name)
         result["joinConditionCount"] = len(join_conditions)
         result["joinConditions"] = join_conditions
+
+    flt = field_filter.strip().upper()
+
+    if include_nodes:
+        result["nodeTree"] = model.node_tree()
+        result["nodes"] = model.node_summaries()
+
+    if include_mappings:
+        mappings = []
+        total = 0
+        for node_name, inputs in model.inputs.items():
+            for inp in inputs:
+                if inp["kind"] != "provider":
+                    continue
+                rows = []
+                for m in inp["mappings"]:
+                    total += 1
+                    clean = _hcpr_clean_source(m["source"], inp["name"])
+                    outputs = model.trace_forward(node_name, m["target"])
+                    row = {"sourceField": m["source"]}
+                    if clean != m["source"]:
+                        row["sourceFieldName"] = clean
+                    row["targetField"] = m["target"]
+                    row["outputFields"] = outputs
+                    uses = model.formula_uses(node_name, m["target"])
+                    if uses:
+                        row["feedsCalculatedFields"] = uses
+                    if not outputs and not uses:
+                        row["notInOutput"] = True
+                    for k in ("mappingType", "constant"):
+                        if k in m:
+                            row[k] = m[k]
+                    if only_renamed and clean == m["target"] and outputs == [m["target"]]:
+                        continue
+                    if flt and not any(
+                        flt in (v or "").upper()
+                        for v in [m["source"], clean, m["target"], *outputs]
+                    ):
+                        continue
+                    rows.append(row)
+                if rows or not (flt or only_renamed):
+                    mappings.append(
+                        {
+                            "provider": inp["name"],
+                            "providerType": inp["providerType"],
+                            "alias": inp["alias"],
+                            "enteredAt": node_name,
+                            "mappingCount": len(inp["mappings"]),
+                            "assignments": rows,
+                        }
+                    )
+        result["mappingTotal"] = total
+        result["mappings"] = mappings
+
+    if include_lineage:
+        lineage = []
+        unassigned = []
+        out_elems = model.elements.get(model.output_node, [])
+        # For a Union output node, report which direct part providers do not
+        # feed a field (they deliver it empty). alias -> provider name.
+        union_inputs: dict = {}
+        if model.output_node in model.nodes and _hcpr_xsi(model.nodes[model.output_node]) == "Union":
+            union_inputs = {
+                (i["alias"] or i["name"]): i["name"]
+                for i in model.inputs[model.output_node]
+                if i["kind"] == "provider"
+            }
+        for el in out_elems:
+            origins = model.trace_back(model.output_node, el["name"])
+            if not origins:
+                unassigned.append(el["name"])
+            if flt:
+                hay = [el["name"], el["infoObject"], el["label"]] + [
+                    o.get("sourceField", "") for o in origins
+                ] + [o.get("sourceFieldName", "") for o in origins]
+                if not any(flt in (v or "").upper() for v in hay):
+                    continue
+            entry = {"name": el["name"]}
+            entry.update(
+                {k: v for k, v in el.items() if k not in ("name", "formula", "formulaFields", "calculated") and v}
+            )
+            entry["origins"] = origins
+            if union_inputs and not el.get("calculated"):
+                fed = {o.get("alias") for o in origins if "alias" in o}
+                missing = [a for a in union_inputs if a not in fed]
+                if missing:
+                    entry["notFedBy"] = [union_inputs[a] for a in missing]
+            lineage.append(entry)
+        result["outputFieldCount"] = len(out_elems)
+        result["lineage"] = lineage
+        result["unassignedFields"] = unassigned
 
     return result
 
@@ -2589,19 +3136,12 @@ def _ina_post(
     return response.json()
 
 
-def _ina_field_name(var: dict, dim: dict) -> str:
-    """Pick the SetOperand.FieldName for a variable's selection.
-
-    Mirrors sap.bw4.lib.olap.Variable#serializeForSubmit: hierarchy
-    variables key off the hierarchy attribute, date variables off the plain
-    key, everything else prefers a DISPLAY_KEY(_NC) attribute if the
-    dimension has one.
+def _ina_default_field_name(dim: dict) -> str:
+    """Pick the SetOperand.FieldName for a plain (non-variable) restriction
+    on a dimension: date dimensions key off the plain key attribute,
+    everything else prefers a DISPLAY_KEY(_NC) attribute if the dimension
+    has one.
     """
-    semantic_type = var.get("SemanticType")
-    if semantic_type == "HierarchyNodeVariable":
-        return dim["AttributeHierarchy"]["HierarchyKeyAttribute"]
-    if semantic_type == "HierarchyNameVariable":
-        return dim["KeyAttribute"]
     if dim.get("DimensionType") == 7:  # Date
         return dim["KeyAttribute"]
     names = dim["AttributeHierarchy"]["AttributeNames"]
@@ -2614,19 +3154,61 @@ def _ina_field_name(var: dict, dim: dict) -> str:
     return dim["KeyAttribute"]
 
 
-def _ina_serialize_variable(var: dict, dims_by_name: dict) -> dict:
-    """Build one Variables[] entry, reusing the variable's current (default
-    or already-submitted) value rather than letting the caller override it.
+def _ina_field_name(var: dict, dim: dict) -> str:
+    """Pick the SetOperand.FieldName for a variable's selection.
+
+    Mirrors sap.bw4.lib.olap.Variable#serializeForSubmit: hierarchy
+    variables key off the hierarchy attribute, everything else uses the
+    same rule as a plain restriction (see _ina_default_field_name).
+    """
+    semantic_type = var.get("SemanticType")
+    if semantic_type == "HierarchyNodeVariable":
+        return dim["AttributeHierarchy"]["HierarchyKeyAttribute"]
+    if semantic_type == "HierarchyNameVariable":
+        return dim["KeyAttribute"]
+    return _ina_default_field_name(dim)
+
+
+def _ina_filter_subselection(name: str, values, dims_by_name: dict) -> dict:
+    """Build one ad-hoc SubSelection entry restricting characteristic `name`
+    to `values` (equality, or an IN-list when several values are given), in
+    the same shape InA uses for FixedFilter/DynamicFilter and submitted
+    Variables.
+    """
+    dim = dims_by_name.get(name)
+    if dim is None:
+        raise ValueError(f"'{name}' is not a characteristic of this query")
+    if isinstance(values, (str, int, float)):
+        values = [values]
+    return {
+        "SetOperand": {
+            "FieldName": dim["KeyAttribute"],
+            "Elements": [{"Low": str(v)} for v in values],
+        }
+    }
+
+
+def _ina_serialize_variable(var: dict, dims_by_name: dict, override=None) -> dict:
+    """Build one Variables[] entry. With no `override`, reuses the
+    variable's current (default or already-submitted) value. With
+    `override` (a value or list of values), submits that instead -
+    equality, or an IN-list when several values are given.
     """
     dim = dims_by_name[var["DimensionReference"]["Name"]]
     values = copy.deepcopy(
         var.get("Values", {"Selection": {"SetOperand": {"Elements": []}}})
     )
     values["Selection"]["SetOperand"]["FieldName"] = _ina_field_name(var, dim)
-    for element in values["Selection"]["SetOperand"].get("Elements", []):
-        element.pop("operation", None)
-        if element.get("Comparison") == "=":
-            element.pop("Comparison", None)
+    if override is not None:
+        override_values = [override] if isinstance(override, (str, int, float)) else override
+        values["Selection"]["SetOperand"]["Elements"] = [
+            {"Low": str(v)} for v in override_values
+        ]
+    else:
+        for element in values["Selection"]["SetOperand"].get("Elements", []):
+            element.pop("operation", None)
+            if element.get("Comparison") == "=":
+                element.pop("Comparison", None)
     return {"Name": var["Name"], "Values": values}
 
 
@@ -2670,12 +3252,23 @@ def _ina_submit_variables(
     token: str,
     capabilities: list,
     cube: dict,
+    variable_values: dict | None = None,
 ) -> dict:
-    """Step 2: confirm all variables at their current values (the server
-    otherwise refuses a result request with "Variables exist - enter values
-    and submit"). Returns the updated Cube.
+    """Step 2: confirm all variables, submitting each at its current value
+    unless `variable_values` (variable technical name -> value or list of
+    values) overrides it. The server otherwise refuses a result request
+    with "Variables exist - enter values and submit". Returns the updated
+    Cube.
     """
     dims_by_name = {d["Name"]: d for d in cube["Dimensions"]}
+    if variable_values:
+        known_names = {v["Name"] for v in cube["Variables"]}
+        unknown = set(variable_values) - known_names
+        if unknown:
+            raise ValueError(
+                f"Unknown variable(s) for this query: {', '.join(sorted(unknown))}. "
+                f"Known variables: {', '.join(sorted(known_names))}"
+            )
     definition_dims = [
         {
             "Attributes": [
@@ -2718,7 +3311,12 @@ def _ina_submit_variables(
                     "UseDefaultAttributeKey": False,
                 },
                 "Sort": [],
-                "Variables": [_ina_serialize_variable(v, dims_by_name) for v in cube["Variables"]],
+                "Variables": [
+                    _ina_serialize_variable(
+                        v, dims_by_name, (variable_values or {}).get(v["Name"])
+                    )
+                    for v in cube["Variables"]
+                ],
             },
             "ProcessingDirectives": {"ProcessingStep": "VariableSubmit"},
         },
@@ -2787,9 +3385,12 @@ def _ina_fetch_result(
     extra_row_dims: list[str],
     row_limit: int,
     column_limit: int,
+    filters: dict | None = None,
 ) -> dict:
     """Step 3: request the result grid, with extra_row_dims added to the row
-    axis ahead of the query's own Rows/Columns dimensions.
+    axis ahead of the query's own Rows/Columns dimensions, and `filters`
+    (characteristic name -> value or list of values) applied as additional
+    ad-hoc restrictions alongside the query's design-time filters.
     """
     dims_by_name = {d["Name"]: d for d in cube["Dimensions"]}
     rowcol_dims = [d for d in cube["Dimensions"] if d.get("AxisDefault") in ("Rows", "Columns")]
@@ -2812,6 +3413,11 @@ def _ina_fetch_result(
         design_filter = cube.get(filter_key) or {}
         design_time_subselections.extend(
             design_filter.get("Selection", {}).get("Operator", {}).get("SubSelections", [])
+        )
+
+    for name, values in (filters or {}).items():
+        design_time_subselections.append(
+            _ina_filter_subselection(name, values, dims_by_name)
         )
 
     body = {
@@ -2954,32 +3560,69 @@ def _ina_parse_grid(grid: dict) -> dict:
 def read_query_data_drilldown(
     query_name: str,
     drilldown: list[str],
+    filters: dict | None = None,
+    variable_values: dict | None = None,
     row_limit: int = 200,
     column_limit: int = 50,
 ) -> dict:
     """
     Execute a BW Query with an AD-HOC DRILLDOWN not present in its saved
     default view (e.g. add "Customer: CPV Band" to a Sales History query
-    that doesn't have it on rows/columns by default).
+    that doesn't have it on rows/columns by default), optionally restricted
+    by an AD-HOC FILTER on one or more characteristics and/or overriding
+    one or more of the query's VARIABLE values.
 
     read_query_data always returns the query's saved default view - it has
     no way to add a characteristic that the query designer left on the
-    "free" axis (available, but not currently drilled into). This tool
-    fills that gap: it adds the given characteristic(s) to the row axis,
-    in addition to the query's existing row/column characteristics, then
-    executes the query and returns the resulting grid.
+    "free" axis (available, but not currently drilled into), no way to
+    restrict the result to specific characteristic values before execution,
+    and no way to submit a variable value other than the query's default.
+    This tool fills those gaps: it adds the given characteristic(s) to the
+    row axis, restricts the result to the given filter values, and/or
+    submits the given variable overrides, in addition to the query's
+    existing row/column characteristics, design-time filters, and other
+    variables (submitted at their default values), then executes the query
+    and returns the resulting grid.
 
     HOW THIS WORKS: BW/4HANA's own "Data Preview" Fiori app talks to an
     internal, undocumented HTTP API called InA (Information Access) at
     /sap/bw/ina/GetResponse. This tool replicates that protocol in three
     calls: fetch the query's full metadata, submit its variables (at their
-    CURRENT/DEFAULT values only - this tool does not accept variable value
-    overrides), then request a result grid with the extra drilldown applied.
-    Validated end to end, including a two-level nested row drilldown.
+    default value, or the given `variable_values` override), then request a
+    result grid with the extra drilldown and filter restrictions applied.
+    The filter is pushed down server-side (via the same Filter/SubSelections
+    mechanism InA uses to re-apply the query's own design-time filters) -
+    it is not a client-side post-filter of the full result. Validated end
+    to end, including a two-level nested row drilldown.
+
+    `filters` vs. `variable_values` - use the right one:
+      - A characteristic can be restricted by BOTH a query variable (which
+        this tool otherwise submits at its default) AND an ad-hoc `filters`
+        entry at the same time - they combine with AND. If the variable's
+        default is narrower than what you want (e.g. a "current fiscal
+        year" variable), a `filters` restriction outside that default
+        range silently intersects to nothing (empty result, no error) -
+        use `variable_values` to change the variable's own value instead.
+      - Check get_query_filters first: a "Default Value" restriction on a
+        characteristic is driven by a variable - override the variable
+        (via `variable_values`, using its variable name, e.g.
+        "0CALDAY_CEX_SV_MAND_INP02") if you need a value outside that
+        variable's default. A "Fixed Filter" is baked into the query
+        design itself and cannot be overridden by either mechanism.
 
     LIMITATIONS:
-      - Mandatory variables are submitted with their default values, same
-        as read_query_data - there is no way to pass a different value.
+      - `filters`/`variable_values` values are matched by equality (or
+        membership, for a list of values) against the characteristic's
+        internal key attribute - for a compounded characteristic (e.g.
+        0FISCYEAR, compounded on 0FISCVARNT), that means the full compound
+        key (e.g. "V52022", not "2022"); for a date variable, BW's internal
+        YYYYMMDD format (e.g. "20230101" for 1 Jan 2023). No ranges,
+        exclusions, or comparison operators (">", "<=").
+      - A variable driven by a customer-exit/SAP-exit routine (common for
+        "current date"-style variables) may recompute its own value from
+        that routine's logic regardless of what's submitted, depending on
+        how the exit is implemented - `variable_values` cannot guarantee
+        an override in that case.
       - This is an undocumented, reverse-engineered protocol (no SAP
         documentation backs it, unlike the BW Modeling API read_query_data
         uses), so treat it as less battle-tested. The result-fetch step
@@ -2990,15 +3633,25 @@ def read_query_data_drilldown(
         row_limit; this tool already does that automatically, but a query
         with filter constructs not covered by that logic could still hit
         this.
-      - You can only add a characteristic that is already part of the
-        query's design (any axis, including "free"); check
-        get_query_structure for what's available. You cannot introduce an
-        InfoObject the query doesn't reference at all.
+      - You can only drill down on or filter a characteristic that is
+        already part of the query's design (any axis, including "free");
+        check get_query_structure for what's available. You cannot
+        introduce an InfoObject the query doesn't reference at all.
 
     Args:
         query_name: Query technical name.
         drilldown: Characteristic technical name(s) to add to the row axis,
             nested in the given order (e.g. ["0SOLD_TO__0CUST_CLASS"]).
+        filters: Optional ad-hoc restrictions applied before execution, as
+            {characteristic_name: value} or {characteristic_name: [value,
+            ...]} (e.g. {"0CUSTOMER": "0003021808", "0FISCPER": ["2024001",
+            "2024002"]}). Combined with AND across characteristics; values
+            for the same characteristic are combined with OR (an IN-list).
+        variable_values: Optional overrides for the query's own variables
+            (see get_query_filters/read_query_data for variable names), as
+            {variable_name: value} or {variable_name: [value, ...]} (e.g.
+            {"0CALDAY_CEX_SV_MAND_INP02": "20230101"}). Variables not
+            listed here are submitted at their default value, as usual.
         row_limit: Max rows to request (default 200).
         column_limit: Max columns to request (default 50).
 
@@ -3013,9 +3666,19 @@ def read_query_data_drilldown(
     try:
         session, token, capabilities = _ina_session(conn)
         cube = _ina_fetch_metadata(session, conn, token, capabilities, query_name)
-        cube = _ina_submit_variables(session, conn, token, capabilities, cube)
+        cube = _ina_submit_variables(
+            session, conn, token, capabilities, cube, variable_values
+        )
         result = _ina_fetch_result(
-            session, conn, token, capabilities, cube, drilldown, row_limit, column_limit
+            session,
+            conn,
+            token,
+            capabilities,
+            cube,
+            drilldown,
+            row_limit,
+            column_limit,
+            filters,
         )
     except requests.exceptions.Timeout:
         return {
@@ -3049,9 +3712,222 @@ def read_query_data_drilldown(
     return {
         "query": query_name,
         "drilldown": drilldown,
+        "filters": filters or {},
+        "variableValues": variable_values or {},
         "messages": messages,
         **parsed,
     }
+
+
+# ---------------------------------------------------------------------------
+# ADT Data Preview - freestyle Open SQL
+#
+# This is the same service ABAP Development Tools (Eclipse) uses for its
+# "Open SQL Console" / freestyle data preview, and what the abap-adt-api
+# library's runQuery() wraps (see mcp-abap-abap-adt-api's QueryHandlers.ts
+# and node_modules/abap-adt-api/build/api/tablecontents.js). Unlike the InA
+# protocol above, this IS a documented-ish, stable part of ADT tooling - it
+# just needs a CSRF handshake since it's a POST.
+# ---------------------------------------------------------------------------
+
+_ADT_INT_TYPES = {"I", "b", "8", "s"}
+_ADT_FLOAT_TYPES = {"/", "a", "e", "F", "N", "%", "P"}
+_ADT_DATE_TYPE = "D"
+
+
+def _adt_local(tag: str) -> str:
+    return tag.split("}")[-1] if "}" in tag else tag
+
+
+def _adt_attrs(elem) -> dict:
+    return {_adt_local(k): v for k, v in elem.attrib.items()}
+
+
+def _adt_csrf_session(conn: BWConnection) -> tuple[requests.Session, str]:
+    """Open a session and fetch a real CSRF token via a small ADT endpoint
+    (the compatibility graph, ~30KB) - freestyle/ddic data preview is a POST
+    and rejects "fetch" outright rather than returning a token for it.
+    """
+    session = requests.Session()
+    session.auth = (conn.username, conn.password)
+    session.params = {"sap-client": conn.client}
+    session.verify = conn.verify_ssl
+
+    response = session.get(
+        f"{conn.base_url}/sap/bc/adt/compatibility/graph",
+        headers={"X-CSRF-Token": "fetch"},
+        timeout=30,
+    )
+    response.raise_for_status()
+    return session, response.headers.get("x-csrf-token", "")
+
+
+def _adt_decode_value(type_code: str, raw: str):
+    """Convert one cell's raw string value per its ABAP type code, mirroring
+    abap-adt-api's decodeQueryResult/parseValue.
+    """
+    if raw == "":
+        return None if type_code in _ADT_INT_TYPES or type_code in _ADT_FLOAT_TYPES else raw
+    if type_code == _ADT_DATE_TYPE and len(raw) >= 8 and raw[:8].isdigit():
+        return f"{raw[0:4]}-{raw[4:6]}-{raw[6:8]}"
+    if type_code in _ADT_FLOAT_TYPES:
+        try:
+            return float(raw)
+        except ValueError:
+            return raw
+    if type_code in _ADT_INT_TYPES:
+        try:
+            return int(raw)
+        except ValueError:
+            return raw
+    return raw
+
+
+def _parse_datapreview_response(xml_text: str, decode: bool) -> dict:
+    """Parse a dataPreview:tableData response (freestyle or ddic) into
+    {columns, values, rowCount, totalRows, executedQuery,
+    queryExecutionTimeSeconds}.
+    """
+    root = ET.fromstring(xml_text)
+
+    def _child_text(name: str) -> str | None:
+        elem = next((e for e in root if _adt_local(e.tag) == name), None)
+        return elem.text if elem is not None else None
+
+    columns_meta = []
+    column_data = []  # (name, type_code, [raw values])
+    for col_elem in root:
+        if _adt_local(col_elem.tag) != "columns":
+            continue
+        metadata_elem = next((c for c in col_elem if _adt_local(c.tag) == "metadata"), None)
+        dataset_elem = next((c for c in col_elem if _adt_local(c.tag) == "dataSet"), None)
+        attrs = _adt_attrs(metadata_elem) if metadata_elem is not None else {}
+        values = [d.text or "" for d in dataset_elem] if dataset_elem is not None else []
+        name = attrs.get("name", "")
+        type_code = attrs.get("type", "")
+        columns_meta.append(
+            {
+                "name": name,
+                "type": type_code,
+                "description": attrs.get("description", ""),
+                "keyAttribute": attrs.get("keyAttribute") == "true",
+                "colType": attrs.get("colType", ""),
+                "isKeyFigure": attrs.get("isKeyFigure") == "true",
+            }
+        )
+        column_data.append((name, type_code, values))
+
+    row_count = max((len(values) for _, _, values in column_data), default=0)
+    rows = []
+    for i in range(row_count):
+        row = {}
+        for name, type_code, values in column_data:
+            raw = values[i] if i < len(values) else ""
+            row[name] = _adt_decode_value(type_code, raw) if decode else raw
+        rows.append(row)
+
+    total_rows_text = _child_text("totalRows")
+    exec_time_text = _child_text("queryExecutionTime")
+
+    return {
+        "columns": columns_meta,
+        "values": rows,
+        "rowCount": len(rows),
+        "totalRows": int(total_rows_text) if total_rows_text and total_rows_text.isdigit() else len(rows),
+        "executedQuery": _child_text("executedQueryString") or "",
+        "queryExecutionTimeSeconds": float(exec_time_text) if exec_time_text else None,
+    }
+
+
+@mcp.tool
+def run_sql_query(sql_query: str, row_number: int = 100, decode: bool = True) -> dict:
+    """
+    Run a read-only ABAP Open SQL query against the BW system's database
+    tables/views and return the result rows.
+
+    This is for reading raw tables, generated ADSO/CompositeProvider tables,
+    or DDIC views directly with SQL - e.g. an InfoObject's master-data
+    attribute table ("SELECT customer, 0cust_class FROM /bi0/pcustomer
+    WHERE customer = '0003021808'"), or any other ABAP-visible table. It
+    uses the same ADT "Data Preview" service that powers Eclipse's Open SQL
+    Console (and is what the separate bw-adt-* MCP server's runQuery tool
+    wraps too) - so it's ABAP Open SQL, not native HANA SQL: no "FROM
+    DUMMY", joins/functions are whatever Open SQL supports on this system.
+
+    HOW THIS DIFFERS from read_query_data / read_query_data_drilldown: those
+    execute a BW QUERY - its OLAP logic (variables, restricted/calculated
+    key figures, currency translation, exception aggregation) all get
+    applied. This tool runs a plain SQL SELECT against the underlying
+    tables - no query logic is applied at all, so it's the right tool when
+    you need to look up a specific record (e.g. one customer's master-data
+    attribute) rather than execute a query's design.
+
+    READING FROM AN ADSO (Advanced DataStore Object): each ADSO physically
+    generates several /BIC/A<name><suffix> tables - 1=inbound (staged, not
+    yet activated), 2=active (activated data), 3=change log, plus some
+    generated view tables. Querying only the active table (suffix 2) misses
+    records that are loaded but not yet activated. Suffix 7 is a generated
+    view unioning inbound + active, so prefer it (e.g. "/bic/ab020_d037")
+    when you want the ADSO's full current-state data regardless of
+    activation status. Confirm the exact table for a given ADSO first (its
+    suffix scheme can vary by ADSO type) with something like:
+    "SELECT tabname, ddtext FROM dd02t WHERE tabname LIKE '%<adso_name>%'
+    AND ddlanguage = 'E'".
+
+    LIMITATIONS:
+      - Read-only; write statements are not meaningful here and not
+        supported by this tool's use case.
+      - row_number caps how many rows come back (like an implicit "UP TO n
+        ROWS"); totalRows in the response tells you if more existed.
+      - Requires the same authorizations as the ABAP Open SQL Console in
+        Eclipse - a locked-down system may reject this even though the user
+        can browse tables via other means.
+
+    Args:
+        sql_query: ABAP Open SQL SELECT statement (e.g. "SELECT mandt,
+            customer, name1 FROM /bi0/pcustomer WHERE customer =
+            '0003021808'"). No trailing period needed.
+        row_number: Max rows to fetch (default 100).
+        decode: If True (default), convert numeric/date column values to
+            native JSON types (int/float, ISO date string) instead of raw
+            ABAP strings.
+
+    Returns:
+        Dictionary with:
+          - columns: list of {name, type, description, keyAttribute,
+            colType, isKeyFigure} (type is the ABAP kind code, e.g. "C"=char,
+            "P"=packed, "D"=date, "I"=int)
+          - values: list of row dicts keyed by column name
+          - rowCount: number of rows returned (<= row_number)
+          - totalRows: total rows the query matched (may exceed rowCount)
+          - executedQuery: the actual ABAP statement the server ran
+          - queryExecutionTimeSeconds
+    """
+    conn = BWConnection.from_env()
+
+    try:
+        session, token = _adt_csrf_session(conn)
+        response = session.post(
+            f"{conn.base_url}/sap/bc/adt/datapreview/freestyle",
+            params={"rowNumber": row_number},
+            headers={
+                "Accept": "application/*",
+                "Content-Type": "text/plain",
+                "X-CSRF-Token": token,
+            },
+            data=sql_query.encode("utf-8"),
+            timeout=90,
+        )
+        response.raise_for_status()
+    except requests.exceptions.HTTPError as e:
+        return {
+            "error": f"HTTP {e.response.status_code}: {e.response.reason}",
+            "detail": e.response.text[:500],
+            "sqlQuery": sql_query,
+        }
+
+    result = _parse_datapreview_response(response.text, decode)
+    return {"sqlQuery": sql_query, **result}
 
 
 # ---------------------------------------------------------------------------
@@ -3219,11 +4095,15 @@ def _dtp_local(tag: str) -> str:
 def _parse_dtp_filter_field(field_elem) -> dict:
     """Parse one <fields> element of a DTP filter into a compact restriction.
 
-    A filtered field carries filterSelection="X" and one or more <selection>
-    children. Each <selection> has an operator (Equal/Between/...) and an
-    excluding flag (true -> Exclude/E, false -> Include/I), with a <low> value
-    and optional <high> value. The <operators> children are UI metadata (the
-    list of available operators) and are ignored.
+    A filtered field carries filterSelection="X" and either:
+      - one or more <selection> children (fixed value/range restriction).
+        Each <selection> has an operator (Equal/Between/...) and an
+        excluding flag (true -> Exclude/E, false -> Include/I), with a <low>
+        value and optional <high> value; or
+      - a <routine> child (ABAP routine restriction), holding the routine
+        source as a sequence of <code> lines instead of fixed selections.
+    The <operators> children are UI metadata (the list of available
+    operators) and are ignored.
     """
     selections = []
     for sel in field_elem:
@@ -3241,19 +4121,35 @@ def _parse_dtp_filter_field(field_elem) -> dict:
         if high_elem is not None and high_elem.get("value") is not None:
             entry["high"] = high_elem.get("value")
         selections.append(entry)
-    return {
+
+    result: dict = {
         "field": field_elem.get("name", ""),
         "dtaName": field_elem.get("dtaName", ""),
         "description": field_elem.get("description", ""),
         "selections": selections,
     }
 
+    routine_elem = next(
+        (c for c in field_elem if _dtp_local(c.tag) == "routine"), None
+    )
+    if routine_elem is not None:
+        code_lines = [
+            (c.text or "") for c in routine_elem if _dtp_local(c.tag) == "code"
+        ]
+        result["filterType"] = "routine"
+        result["abapCode"] = "\n".join(code_lines)
+    elif selections:
+        result["filterType"] = "selection"
+
+    return result
+
 
 def _parse_dtp_filters(root) -> list[dict]:
     """Return the DTP's filter restrictions - one entry per filtered field.
 
-    Only fields that actually carry a selection are returned (fields present
-    in the model purely as filterable candidates are skipped).
+    Only fields that actually carry a restriction - fixed <selection>(s) or
+    an ABAP <routine> - are returned (fields present in the model purely as
+    filterable candidates are skipped).
     """
     filt = next((e for e in root.iter() if _dtp_local(e.tag) == "filter"), None)
     if filt is None:
@@ -3262,10 +4158,10 @@ def _parse_dtp_filters(root) -> list[dict]:
     for field_elem in filt:
         if _dtp_local(field_elem.tag) != "fields":
             continue
-        has_selection = any(
-            _dtp_local(c.tag) == "selection" for c in field_elem
+        has_restriction = any(
+            _dtp_local(c.tag) in ("selection", "routine") for c in field_elem
         )
-        if not has_selection:
+        if not has_restriction:
             continue
         filters.append(_parse_dtp_filter_field(field_elem))
     return filters
@@ -3319,7 +4215,10 @@ def get_dtp_details(
             packageSize, parallelExtraction, processingMode (+ label),
             errorHandling (requestHandling, numberOfErrorsPerPackage)
           - filters: one entry per filtered field, each with field, dtaName,
-            description, and selections (each: sign I/E, operator, low, high?)
+            description, filterType (selection/routine), and either
+            selections (each: sign I/E, operator, low, high?) for a fixed
+            restriction or abapCode (the routine source) for an ABAP-routine
+            restriction
           - filterCount / filterTotal (when filters are included)
     """
     section_norm = (section or "all").strip().lower()
@@ -3771,6 +4670,269 @@ def get_infoarea_tree(info_area: str, recursive: bool = True, max_depth: int = 1
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# ADT repository - read-only access to ABAP source code
+#
+# Objects are resolved through the ADT repository information system search
+# (/sap/bc/adt/repository/informationsystem/search, operation=quickSearch),
+# which returns each object's ADT URI - e.g.
+#   PROG/P  /sap/bc/adt/programs/programs/zsandbox
+#   CLAS/OC /sap/bc/adt/oo/classes/%2fbic%2fjvwyp715zshw1j8tbvi4_a
+#   FUGR/FF /sap/bc/adt/functions/groups/rsdri/fmodules/rsdri_infoprov_read
+# and the source is served (as text/plain) at <uri>/source/main. Classes also
+# have separate includes at <uri>/includes/<definitions|implementations|
+# macros|testclasses>. These tools only issue GETs - nothing is locked,
+# changed or activated.
+# ---------------------------------------------------------------------------
+
+# Friendly type aliases -> ADT object type codes used by the search.
+_ADT_TYPE_ALIASES = {
+    "PROG": "PROG/P",
+    "PROGRAM": "PROG/P",
+    "REPORT": "PROG/P",
+    "INCL": "PROG/I",
+    "INCLUDE": "PROG/I",
+    "CLAS": "CLAS/OC",
+    "CLASS": "CLAS/OC",
+    "INTF": "INTF/OI",
+    "INTERFACE": "INTF/OI",
+    "FUNC": "FUGR/FF",
+    "FM": "FUGR/FF",
+    "FUNCTION": "FUGR/FF",
+    "FUGR": "FUGR/F",
+    "DDLS": "DDLS/DF",
+    "CDS": "DDLS/DF",
+    "TABL": "TABL/DT",
+    "TABLE": "TABL/DT",
+}
+
+# Object types whose source is served at <uri>/source/main.
+_ADT_SOURCE_TYPES = {"PROG/P", "PROG/I", "CLAS/OC", "INTF/OI", "FUGR/FF", "DDLS/DF", "TABL/DT"}
+
+_ADT_CLASS_INCLUDES = ("definitions", "implementations", "macros", "testclasses")
+
+
+def _adt_get(conn: BWConnection, path: str, accept: str = "*/*", params: dict | None = None) -> requests.Response:
+    """Authenticated GET against an ADT resource (read-only, no CSRF needed)."""
+    response = requests.get(
+        f"{conn.base_url}{path}",
+        auth=(conn.username, conn.password),
+        headers={"Accept": accept, "sap-client": conn.client},
+        params=params,
+        verify=conn.verify_ssl,
+        timeout=60,
+    )
+    response.raise_for_status()
+    return response
+
+
+def _adt_search(conn: BWConnection, query: str, adt_type: str = "", max_results: int = 50) -> list[dict]:
+    params = {"operation": "quickSearch", "query": query, "maxResults": max_results}
+    if adt_type:
+        params["objectType"] = adt_type
+    response = _adt_get(
+        conn,
+        "/sap/bc/adt/repository/informationsystem/search",
+        accept="application/xml",
+        params=params,
+    )
+    root = ET.fromstring(response.text)
+    results = []
+    for ref in root.iter():
+        if _adt_local(ref.tag) != "objectReference":
+            continue
+        a = _adt_attrs(ref)
+        results.append(
+            {
+                "name": a.get("name", ""),
+                "type": a.get("type", ""),
+                "description": a.get("description", ""),
+                "package": a.get("packageName", ""),
+                "uri": a.get("uri", ""),
+            }
+        )
+    return results
+
+
+def _adt_normalize_type(object_type: str) -> str:
+    t = (object_type or "").strip().upper()
+    return _ADT_TYPE_ALIASES.get(t, t)
+
+
+def _abap_extract_method(source: str, method: str) -> str:
+    """Return the METHOD <name>. ... ENDMETHOD. block from a class source."""
+    pattern = re.compile(
+        rf"^[ \t]*METHOD[ \t]+{re.escape(method)}\b.*?^[ \t]*ENDMETHOD[ \t]*\.",
+        re.IGNORECASE | re.MULTILINE | re.DOTALL,
+    )
+    m = pattern.search(source)
+    return m.group(0) if m else ""
+
+
+@mcp.tool
+def search_abap_objects(
+    search_term: str, object_type: str = "", max_results: int = 50
+) -> dict:
+    """
+    Search the ABAP repository (via ADT) for programs, classes, interfaces,
+    function modules, CDS views, tables, packages, ... by name.
+
+    Read-only. Use it to find the exact name/type before calling
+    get_abap_source, or to answer "which Z programs/classes exist for X".
+
+    Args:
+        search_term: Name or pattern; "*" is a wildcard (e.g. "ZSAND*",
+            "/BIC/JVWYP*", "CL_CTS_HDI*"). Case-insensitive.
+        object_type: Optional filter - an ADT type code ("PROG/P", "CLAS/OC",
+            "INTF/OI", "FUGR/FF", "DDLS/DF", "TABL/DT", "DEVC/K", ...) or a
+            friendly alias (PROGRAM, INCLUDE, CLASS, INTERFACE, FUNCTION, CDS,
+            TABLE). Leave empty for all types.
+        max_results: Maximum number of hits (default 50).
+
+    Returns:
+        Dictionary with the search term, count and ``results`` - each with
+        name, type (ADT type code), description, package and ADT uri.
+    """
+    conn = BWConnection.from_env()
+    adt_type = _adt_normalize_type(object_type)
+    try:
+        results = _adt_search(conn, search_term, adt_type, max_results)
+    except requests.exceptions.HTTPError as e:
+        return {
+            "error": f"HTTP {e.response.status_code}: {e.response.reason}",
+            "detail": e.response.text[:500],
+            "searchTerm": search_term,
+        }
+    return {"searchTerm": search_term, "objectType": adt_type, "count": len(results), "results": results}
+
+
+@mcp.tool
+def get_abap_source(
+    object_name: str,
+    object_type: str = "",
+    method: str = "",
+    include_class_includes: bool = False,
+    start_line: int = 1,
+    max_lines: int = 0,
+) -> dict:
+    """
+    Read the ABAP source code of a program, include, class, interface,
+    function module, CDS view or table definition (via ADT). Read-only.
+
+    Typical uses: read a Z report, a transformation's generated AMDP class
+    (e.g. "/BIC/JVWYP715ZSHW1J8TBVI4_A" - see classNameA in
+    get_transformation_details) or one of its methods (method="GLOBAL_END"),
+    an SAP standard class/report, or a function module.
+
+    Args:
+        object_name: Technical name (e.g. "ZSANDBOX", "CL_CTS_HDI_CONTAINER_API",
+            "RSDRI_INFOPROV_READ"). Namespaced names like "/BIC/..." work.
+        object_type: Optional, to disambiguate names that exist as several
+            types (e.g. a package and a program both named ZSANDBOX): ADT
+            type code (PROG/P, PROG/I, CLAS/OC, INTF/OI, FUGR/FF, DDLS/DF,
+            TABL/DT) or alias (PROGRAM, INCLUDE, CLASS, INTERFACE, FUNCTION,
+            CDS, TABLE). If empty, the first object with readable source is
+            used.
+        method: For classes/interfaces - return only this method's
+            METHOD ... ENDMETHOD block (plus its line position) instead of the
+            whole source. Searched in the main source and, for classes, the
+            local implementations include.
+        include_class_includes: For classes - also return the local
+            definitions, local implementations, macros and test classes
+            includes (non-empty ones only).
+        start_line / max_lines: Page through long sources (1-based start;
+            max_lines=0 returns everything from start_line). Ignored when
+            method is set.
+
+    Returns:
+        Dictionary with name, type, description, package, uri, totalLines,
+        and either ``source`` (with startLine/returnedLines/hasMore) or
+        ``method`` + ``methodSource``; for classes optionally ``includes``.
+    """
+    conn = BWConnection.from_env()
+    adt_type = _adt_normalize_type(object_type)
+
+    try:
+        hits = _adt_search(conn, object_name, adt_type, max_results=20)
+    except requests.exceptions.HTTPError as e:
+        return {
+            "error": f"HTTP {e.response.status_code}: {e.response.reason}",
+            "detail": e.response.text[:500],
+            "object": object_name,
+        }
+
+    exact = [h for h in hits if h["name"].upper() == object_name.strip().upper()]
+    candidates = [h for h in exact if h["type"] in _ADT_SOURCE_TYPES]
+    if not candidates:
+        return {
+            "error": "No object with readable source found.",
+            "object": object_name,
+            "objectType": adt_type,
+            "matches": exact or hits[:10],
+            "hint": "Check the name with search_abap_objects; supported types: "
+            + ", ".join(sorted(_ADT_SOURCE_TYPES)),
+        }
+    obj = candidates[0]
+
+    try:
+        source = _adt_get(conn, f"{obj['uri']}/source/main", accept="text/plain").text
+    except requests.exceptions.HTTPError as e:
+        return {
+            "error": f"HTTP {e.response.status_code}: {e.response.reason}",
+            "detail": e.response.text[:500],
+            "object": obj,
+        }
+    source = source.replace("\r\n", "\n")
+    lines = source.split("\n")
+
+    result: dict = {k: obj[k] for k in ("name", "type", "description", "package", "uri")}
+    if len(candidates) > 1:
+        result["otherTypes"] = [c["type"] for c in candidates[1:]]
+    result["totalLines"] = len(lines)
+
+    includes: dict = {}
+    if obj["type"] == "CLAS/OC" and (include_class_includes or method):
+        for inc in _ADT_CLASS_INCLUDES:
+            try:
+                text = _adt_get(conn, f"{obj['uri']}/includes/{inc}", accept="text/plain").text
+            except requests.exceptions.HTTPError:
+                continue
+            text = text.replace("\r\n", "\n")
+            # Skip the generated placeholder-only includes.
+            meaningful = [
+                l for l in text.split("\n")
+                if l.strip() and not l.lstrip().startswith(('*"*', "*"))
+            ]
+            if meaningful:
+                includes[inc] = text
+
+    if method:
+        block = _abap_extract_method(source, method)
+        where = "main"
+        if not block and "implementations" in includes:
+            block = _abap_extract_method(includes["implementations"], method)
+            where = "implementations"
+        if not block:
+            result["error"] = f"Method {method} not found."
+            return result
+        base = source if where == "main" else includes["implementations"]
+        result["method"] = method.upper()
+        result["methodFoundIn"] = where
+        result["methodStartLine"] = base[: base.find(block)].count("\n") + 1
+        result["methodSource"] = block
+        return result
+
+    start = max(start_line, 1)
+    end = len(lines) if max_lines <= 0 else min(len(lines), start - 1 + max_lines)
+    result["startLine"] = start
+    result["returnedLines"] = max(end - start + 1, 0)
+    result["hasMore"] = end < len(lines)
+    result["source"] = "\n".join(lines[start - 1 : end])
+    if include_class_includes and includes:
+        result["includes"] = includes
+    return result
 
 
 def main() -> None:
